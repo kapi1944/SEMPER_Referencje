@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "SEMPER – Referencje OCR",
+  "version": "0.3.6",
+  "description": "OCR referencji SEMPER z klasyfikatorem 3.0, zatwierdzaniem tytułu, stabilnym edytorem kategorii, zbiorczym OCR i usprawnioną nawigacją listy.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.szkolenia-semper.pl/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.szkolenia-semper.pl/wavepanel/ref.php*",
+        "https://www.szkolenia-semper.pl/wavepanel/ref_adm.php*",
+        "https://www.szkolenia-semper.pl/wavepanel/ref_kat.php*",
+        "https://www.szkolenia-semper.pl/__template/img/upload/*"
+      ],
+      "js": [
+        "page/page-bridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://www.szkolenia-semper.pl/wavepanel/ref.php*",
+        "https://www.szkolenia-semper.pl/wavepanel/ref_adm.php*",
+        "https://www.szkolenia-semper.pl/wavepanel/ref_kat.php*",
+        "https://www.szkolenia-semper.pl/__template/img/upload/*"
+      ],
+      "css": [
+        "content/style.css"
+      ],
+      "js": [
+        "content/content.js"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ]
+}
