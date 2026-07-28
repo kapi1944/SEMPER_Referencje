@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SEMPER – Referencje OCR",
-  "version": "0.3.6",
-  "description": "OCR referencji SEMPER z klasyfikatorem 3.0, zatwierdzaniem tytułu, stabilnym edytorem kategorii, zbiorczym OCR i usprawnioną nawigacją listy.",
+  "version": "0.3.16",
+  "description": "OCR referencji SEMPER z klasyfikatorem 3.2, RRMMDD i kompaktowym formularzem: Aktywne, Sortowanie, Po zapisie, Nazwa oraz pełnowymiarowy podgląd oryginału.",
   "permissions": [
     "storage"
   ],

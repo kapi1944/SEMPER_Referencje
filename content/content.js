@@ -2,7 +2,7 @@
   'use strict';
 
   const SOURCE = 'semper-referencje-ocr';
-  const EXTENSION_VERSION = '0.3.5';
+  const EXTENSION_VERSION = '0.3.11';
   const STORAGE_PREFIX = 'semper_ref_v2_';
   const CATEGORY_CACHE_PREFIX = 'semper_ref_cat_v3_';
   const CATEGORY_CACHE_TTL = 10 * 60 * 1000;
@@ -17,10 +17,12 @@
   const DAILY_CATEGORY_ACTIVITY_KEY = 'semper_category_activity_v1';
   const DAILY_CATEGORY_ACTIVITY_RETENTION_DAYS = 120;
   const PENDING_CATEGORY_SAVE_KEY = 'semper_category_save_pending_v1';
+  const AFTER_SAVE_SORT_KEY = 'semper_ref_after_save_sort_v3';
+  const AFTER_SAVE_SORT_DEFAULT = ''; // domyślnie bieżąca data RRMMDD
 
   // Klasyfikator 3.0: hybrydowy model lokalny oparty na podobieństwie tytułów,
   // rdzeniach/fuzzy matching, publicznej ofercie SEMPER i zatwierdzonych decyzjach użytkownika.
-  const CLASSIFIER_VERSION = '3.0.0';
+  const CLASSIFIER_VERSION = '3.2.0';
   const KNOWLEDGE_CACHE_KEY = 'semper_classifier_knowledge_v3';
   const KNOWLEDGE_CACHE_TTL = 30 * 24 * 60 * 60 * 1000;
   const KNOWLEDGE_DISCOVERY_TTL = 7 * 24 * 60 * 60 * 1000;
@@ -57,20 +59,33 @@
     return `${year}-${month}-${day}`;
   }
 
+  function localCompactDateKey(date = new Date()) {
+    const year = String(date.getFullYear()).slice(-2);
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}${month}${day}`;
+  }
+
   function updateDailyCategoryCounterElements(count) {
-    const safeCount = Number.isFinite(Number(count)) ? Number(count) : 0;
+    const safeCount = Math.max(0, Number.isFinite(Number(count)) ? Number(count) : 0);
     document.querySelectorAll('.semper-daily-category-counter').forEach((element) => {
       element.textContent = element.dataset.compact === '1'
         ? `Dzisiaj: ${safeCount}`
-        : `Dzisiaj przypisano kategorie: ${safeCount}`;
-      element.title = 'Liczba unikalnych referencji, którym dzisiaj zapisano co najmniej jedną kategorię w Wavepanelu.';
+        : `Dzisiaj sklasyfikowano referencji: ${safeCount}`;
+      element.title = 'Licznik referencji, którym dzisiaj zapisano co najmniej jedną kategorię. Możesz go skorygować ręcznie przyciskami − / + lub wyzerować.';
     });
+  }
+
+  function normalizeDailyActivityDay(day) {
+    const ids = new Set(Array.isArray(day?.ids) ? day.ids.map(String) : []);
+    const manualAdjustment = Number.isFinite(Number(day?.manualAdjustment)) ? Math.trunc(Number(day.manualAdjustment)) : 0;
+    return { ids, manualAdjustment };
   }
 
   async function getTodayCategoryAssignmentCount() {
     const stored = (await chrome.storage.local.get(DAILY_CATEGORY_ACTIVITY_KEY))[DAILY_CATEGORY_ACTIVITY_KEY] || {};
-    const ids = stored?.days?.[localDateKey()]?.ids;
-    return Array.isArray(ids) ? new Set(ids.map(String)).size : 0;
+    const day = normalizeDailyActivityDay(stored?.days?.[localDateKey()]);
+    return Math.max(0, day.ids.size + day.manualAdjustment);
   }
 
   async function refreshDailyCategoryCounters() {
@@ -81,16 +96,15 @@
     }
   }
 
-  async function markCategoryAssignmentToday(id) {
-    const referenceId = String(id || '').trim();
-    if (!referenceId) return getTodayCategoryAssignmentCount();
-
+  async function writeTodayCategoryActivity(ids, manualAdjustment = 0) {
     const stored = (await chrome.storage.local.get(DAILY_CATEGORY_ACTIVITY_KEY))[DAILY_CATEGORY_ACTIVITY_KEY] || {};
     const days = stored?.days && typeof stored.days === 'object' ? { ...stored.days } : {};
     const today = localDateKey();
-    const ids = new Set(Array.isArray(days[today]?.ids) ? days[today].ids.map(String) : []);
-    ids.add(referenceId);
-    days[today] = { ids: [...ids], updatedAt: Date.now() };
+    days[today] = {
+      ids: [...new Set([...ids].map(String))],
+      manualAdjustment: Math.trunc(Number(manualAdjustment) || 0),
+      updatedAt: Date.now()
+    };
 
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - DAILY_CATEGORY_ACTIVITY_RETENTION_DAYS);
@@ -100,17 +114,69 @@
     }
 
     await chrome.storage.local.set({ [DAILY_CATEGORY_ACTIVITY_KEY]: { days, updatedAt: Date.now() } });
-    updateDailyCategoryCounterElements(ids.size);
-    return ids.size;
+    const count = Math.max(0, new Set([...ids].map(String)).size + Math.trunc(Number(manualAdjustment) || 0));
+    updateDailyCategoryCounterElements(count);
+    return count;
+  }
+
+  async function markCategoryAssignmentToday(id) {
+    const referenceId = String(id || '').trim();
+    if (!referenceId) return getTodayCategoryAssignmentCount();
+    const stored = (await chrome.storage.local.get(DAILY_CATEGORY_ACTIVITY_KEY))[DAILY_CATEGORY_ACTIVITY_KEY] || {};
+    const day = normalizeDailyActivityDay(stored?.days?.[localDateKey()]);
+    day.ids.add(referenceId);
+    return writeTodayCategoryActivity(day.ids, day.manualAdjustment);
+  }
+
+  async function adjustTodayCategoryAssignmentCount(delta) {
+    const stored = (await chrome.storage.local.get(DAILY_CATEGORY_ACTIVITY_KEY))[DAILY_CATEGORY_ACTIVITY_KEY] || {};
+    const day = normalizeDailyActivityDay(stored?.days?.[localDateKey()]);
+    const current = Math.max(0, day.ids.size + day.manualAdjustment);
+    const requested = Math.max(0, current + Math.trunc(Number(delta) || 0));
+    day.manualAdjustment = requested - day.ids.size;
+    return writeTodayCategoryActivity(day.ids, day.manualAdjustment);
+  }
+
+  async function resetTodayCategoryAssignmentCount() {
+    return writeTodayCategoryActivity(new Set(), 0);
   }
 
   function makeDailyCategoryCounter(compact = false) {
+    const wrap = document.createElement('span');
+    wrap.className = 'semper-daily-category-counter-wrap';
+
     const counter = document.createElement('span');
     counter.className = 'semper-daily-category-counter';
     counter.dataset.compact = compact ? '1' : '0';
-    counter.textContent = compact ? 'Dzisiaj: …' : 'Dzisiaj przypisano kategorie: …';
+    counter.textContent = compact ? 'Dzisiaj: …' : 'Dzisiaj sklasyfikowano referencji: …';
+
+    const minus = document.createElement('button');
+    minus.type = 'button';
+    minus.className = 'semper-daily-counter-btn';
+    minus.textContent = '−';
+    minus.title = 'Zmniejsz licznik o 1';
+
+    const plus = document.createElement('button');
+    plus.type = 'button';
+    plus.className = 'semper-daily-counter-btn';
+    plus.textContent = '+';
+    plus.title = 'Zwiększ licznik o 1';
+
+    const reset = document.createElement('button');
+    reset.type = 'button';
+    reset.className = 'semper-daily-counter-reset';
+    reset.textContent = 'Reset';
+    reset.title = 'Wyzeruj dzisiejszy licznik';
+
+    minus.addEventListener('click', () => adjustTodayCategoryAssignmentCount(-1));
+    plus.addEventListener('click', () => adjustTodayCategoryAssignmentCount(1));
+    reset.addEventListener('click', () => {
+      if (window.confirm('Wyzerować dzisiejszy licznik przypisanych referencji?')) resetTodayCategoryAssignmentCount();
+    });
+
+    wrap.append(minus, counter, plus, reset);
     refreshDailyCategoryCounters();
-    return counter;
+    return wrap;
   }
 
   async function processPendingCategorySaveCounter() {
@@ -733,6 +799,85 @@
     }
   }
 
+  function titleContainsLawMorphology(title) {
+    const tokens = normalize(title).split(' ').filter(Boolean);
+    // Świadomie nie używamy samego prefiksu „praw”, żeby nie łapać słów
+    // takich jak „prawidłowy”. Obejmuje natomiast praktycznie wszystkie
+    // odmiany: prawo, prawa, prawem, prawie, prawny/prawne/prawnych,
+    // prawnie, prawniczy itd.
+    return tokens.some((token) => /^(?:praw|prawo|prawa|prawem|prawie|prawu|prawn\w*|prawnic\w*)$/.test(token));
+  }
+
+  function titleContainsAdministrativeMorphology(title) {
+    const tokens = normalize(title).split(' ').filter(Boolean);
+    return tokens.some((token) => /^(?:administrac\w*|urzednik\w*|urzednic\w*|urzad|urzedu|urzedzie|urzedy|urzedach|urzedami|urzedow\w*)$/.test(token));
+  }
+
+  function applyLegalCombinationRules(results, title) {
+    const byId = new Map(results.map((item) => [item.id, item]));
+    const law = byId.get(8);
+    const construction = byId.get(11);
+    const energy = byId.get(18);
+    const energyLaw = byId.get(37);
+    const copyrightLaw = byId.get(36);
+    const procurement = byId.get(1);
+    const normalizedTitle = normalize(title);
+    const hasLawWord = titleContainsLawMorphology(title);
+    const derivedSuggestions = [];
+
+    const addHit = (item, hit) => {
+      if (!item) return;
+      item.hits = [...new Set([...(item.hits || []), hit])];
+    };
+
+    // Jeżeli tytuł jawnie mówi o prawie / prawnych / prawnie itd., kategoria
+    // „prawo” zawsze ma być widocznym, możliwym do zaznaczenia kandydatem.
+    if (hasLawWord && law) {
+      law.score = Math.max(law.score, 72);
+      addHit(law, 'odmiana słowa „prawo” w tytule');
+    }
+
+    const constructionContext = Boolean(construction && (construction.score >= 45 || /\bbudowlan\w*\b/.test(normalizedTitle)));
+    if (hasLawWord && constructionContext && law && construction) {
+      law.score = Math.max(law.score, 74);
+      construction.score = Math.max(construction.score, 78);
+      addHit(law, 'reguła łączona: prawo budowlane');
+      addHit(construction, 'reguła łączona: prawo budowlane');
+      derivedSuggestions.push({
+        name: 'prawo budowlane',
+        score: Math.max(law.score, construction.score),
+        categoryIds: [11, 8],
+        note: 'W Wavepanelu odpowiada zestawowi: budownictwo + prawo.'
+      });
+    }
+
+    const energyContext = Boolean(energy && (energy.score >= 45 || /\b(?:energetycz\w*|energetyk\w*|energia|oze)\b/.test(normalizedTitle)));
+    if (hasLawWord && energyContext && energyLaw) {
+      energyLaw.score = Math.max(energyLaw.score, 86, Math.round(((law?.score || 72) + (energy?.score || 55)) / 2 + 10));
+      addHit(energyLaw, 'reguła łączona: prawo + energetyka');
+    }
+
+    if (hasLawWord && copyrightLaw && (/\bautorsk\w*\b/.test(normalizedTitle) || copyrightLaw.score >= 45)) {
+      copyrightLaw.score = Math.max(copyrightLaw.score, 86);
+      addHit(copyrightLaw, 'reguła łączona: prawo autorskie');
+    }
+
+    if (hasLawWord && procurement && (/\b(?:zamowien\w* publiczn\w*|pzp|kio|swz)\b/.test(normalizedTitle) || procurement.score >= 55)) {
+      procurement.score = Math.max(procurement.score, 86);
+      addHit(procurement, 'reguła łączona: prawo zamówień publicznych');
+    }
+
+    return derivedSuggestions;
+  }
+
+  function applyAdministrativeMorphologyRule(results, title) {
+    if (!titleContainsAdministrativeMorphology(title)) return;
+    const administration = results.find((item) => item.id === 6);
+    if (!administration) return;
+    administration.score = Math.max(administration.score, 76);
+    administration.hits = [...new Set([...(administration.hits || []), 'odmiana słowa „administracja/urzędnik” w tytule'])];
+  }
+
   function knowledgeSummary() {
     const publicCount = classifierKnowledge.examples?.length || 0;
     const userCount = learnedExamples?.length || 0;
@@ -792,13 +937,14 @@
     return match ? `${match[3]}.${match[2]}.${match[1]}` : '';
   }
 
-  function extractIssueDate(ocrText) {
+  function collectDateCandidates(ocrText) {
     const text = cleanOcr(ocrText);
-    if (!text) return null;
+    if (!text) return [];
     const lines = text.split('\n');
     const candidates = [];
+    let absoluteOffset = 0;
 
-    const addCandidate = (lineIndex, matchIndex, raw, iso) => {
+    const addCandidate = (lineIndex, lineOffset, matchIndex, raw, iso) => {
       if (!iso) return;
       const line = lines[lineIndex] || '';
       const folded = normalize(line);
@@ -820,31 +966,63 @@
       if (/\d{1,2}\s*[-–—]\s*\d{1,2}[.\/-]/.test(line)) score -= 36;
       if (/\b\d{1,2}\s*[-–—]\s*\d{1,2}\s+[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]+\s+20\d{2}\b/.test(line)) score -= 36;
 
-      candidates.push({ iso, raw: String(raw || '').trim(), lineIndex, score });
+      const rawText = String(raw || '').trim();
+      const start = lineOffset + Math.max(0, matchIndex);
+      const end = start + String(raw || '').length;
+      candidates.push({ iso, raw: rawText, lineIndex, score, start, end });
     };
 
     lines.forEach((line, lineIndex) => {
+      const lineOffset = absoluteOffset;
       const numeric = /\b(\d{1,2})[.\/-](\d{1,2})[.\/-](20\d{2})(?:\s*r\.?\b)?/g;
       for (const match of line.matchAll(numeric)) {
-        addCandidate(lineIndex, match.index || 0, match[0], makeIsoDate(match[1], match[2], match[3]));
+        addCandidate(lineIndex, lineOffset, match.index || 0, match[0], makeIsoDate(match[1], match[2], match[3]));
+      }
+
+      const formatRokMiesiacDzien = /\b(20\d{2})-(\d{1,2})-(\d{1,2})(?:\s*r\.?\b)?/g;
+      for (const match of line.matchAll(formatRokMiesiacDzien)) {
+        addCandidate(lineIndex, lineOffset, match.index || 0, match[0], makeIsoDate(match[3], match[2], match[1]));
       }
 
       const words = /\b(\d{1,2})\s+(stycznia|styczen|styczeń|lutego|luty|marca|marzec|kwietnia|kwiecien|kwiecień|maja|maj|czerwca|czerwiec|lipca|lipiec|sierpnia|sierpien|sierpień|wrzesnia|wrzesien|wrzesień|pazdziernika|października|pazdziernik|październik|listopada|listopad|grudnia|grudzien|grudzień)\s+(20\d{2})(?:\s*r\.?\b)?/gi;
       for (const match of line.matchAll(words)) {
         const month = POLISH_MONTHS.get(String(match[2] || '').toLowerCase());
-        addCandidate(lineIndex, match.index || 0, match[0], makeIsoDate(match[1], month, match[3]));
+        addCandidate(lineIndex, lineOffset, match.index || 0, match[0], makeIsoDate(match[1], month, match[3]));
       }
+      absoluteOffset += line.length + 1;
     });
 
+    // Ta sama data potrafi zostać złapana kilkoma bardzo podobnymi wzorcami.
+    const unique = new Map();
+    for (const candidate of candidates) {
+      const key = `${candidate.start}:${candidate.end}:${candidate.iso}`;
+      const previous = unique.get(key);
+      if (!previous || candidate.score > previous.score) unique.set(key, candidate);
+    }
+    return [...unique.values()].sort((a, b) => b.score - a.score || a.lineIndex - b.lineIndex || a.start - b.start);
+  }
+
+  function extractIssueDate(ocrText) {
+    const candidates = collectDateCandidates(ocrText);
     if (!candidates.length) return null;
-    candidates.sort((a, b) => b.score - a.score || a.lineIndex - b.lineIndex);
     const best = candidates[0];
     if (best.score < 50) return null;
     return {
       iso: best.iso,
       raw: best.raw,
       confidence: Math.max(35, Math.min(98, Math.round(best.score))),
-      candidates: candidates.slice(0, 6)
+      candidates: candidates.slice(0, 8)
+    };
+  }
+
+  function parseSelectedIssueDate(text) {
+    const candidates = collectDateCandidates(text);
+    if (!candidates.length) return null;
+    const best = candidates[0];
+    return {
+      iso: best.iso,
+      raw: best.raw,
+      confidence: 100
     };
   }
 
@@ -919,26 +1097,45 @@
   function highlightClass(type) {
     if (type === 'manual') return 'semper-ocr-manual-title-highlight';
     if (type === 'auto') return 'semper-ocr-auto-title-highlight';
+    if (type === 'issue-date') return 'semper-ocr-issue-date-highlight';
+    if (type === 'date') return 'semper-ocr-date-highlight';
     return 'semper-ocr-quote-highlight';
   }
 
-  function renderOcrWithHighlights(element, text, detectedTitle, manualTitle = '', autoScroll = true) {
+  function findIssueDateSpanInOcr(source, issueDateInfo = {}) {
+    const candidates = collectDateCandidates(source);
+    if (!candidates.length) return null;
+    const wantedIso = String(issueDateInfo?.iso || issueDateInfo?.issueDate || '').trim();
+    const wantedRaw = normalize(issueDateInfo?.raw || issueDateInfo?.issueDateRaw || '');
+    const matching = candidates.filter((candidate) => {
+      if (wantedRaw && normalize(candidate.raw) === wantedRaw) return true;
+      return Boolean(wantedIso && candidate.iso === wantedIso);
+    });
+    return (matching.length ? matching : []).sort((a, b) => b.score - a.score || a.start - b.start)[0] || null;
+  }
+
+  function renderOcrWithHighlights(element, text, detectedTitle, manualTitle = '', issueDateInfo = {}, autoScroll = true) {
     const source = String(text || '');
     element.textContent = '';
 
     const ranges = findQuotedSpans(source);
-    const detectedSpan = findTitleSpanInOcr(source, detectedTitle);
-    if (detectedSpan) ranges.push({ ...detectedSpan, type: 'auto', priority: 2 });
+    for (const date of collectDateCandidates(source)) {
+      ranges.push({ start: date.start, end: date.end, type: 'date', priority: 2, iso: date.iso });
+    }
 
-    const hasManualCorrection = Boolean(
-      cleanTitle(manualTitle) && normalize(manualTitle) !== normalize(detectedTitle)
-    );
+    const issueDateSpan = findIssueDateSpanInOcr(source, issueDateInfo);
+    if (issueDateSpan) ranges.push({ ...issueDateSpan, type: 'issue-date', priority: 3 });
+
+    const detectedSpan = findTitleSpanInOcr(source, detectedTitle);
+    if (detectedSpan) ranges.push({ ...detectedSpan, type: 'auto', priority: 4 });
+
+    const hasManualApproval = Boolean(cleanTitle(manualTitle));
     let manualSpan = null;
-    if (hasManualCorrection) {
-      // Jeżeli ręcznie poprawiony tekst nie występuje 1:1 w surowym OCR,
-      // zachowujemy zielone oznaczenie regionu automatycznie rozpoznanego tytułu.
+    if (hasManualApproval) {
+      // Ręcznie zatwierdzony tytuł ma najwyższy priorytet kolorystyczny, nawet
+      // gdy jest identyczny z automatycznie rozpoznanym tytułem.
       manualSpan = findTitleSpanInOcr(source, manualTitle) || detectedSpan;
-      if (manualSpan) ranges.push({ ...manualSpan, type: 'manual', priority: 3 });
+      if (manualSpan) ranges.push({ ...manualSpan, type: 'manual', priority: 5 });
     }
 
     if (!ranges.length) {
@@ -973,9 +1170,11 @@
       const mark = document.createElement('mark');
       mark.className = highlightClass(covering.type);
       mark.dataset.highlightType = covering.type;
-      if (covering.type === 'manual' || (!hasManualCorrection && covering.type === 'auto')) {
+      if (covering.type === 'manual' || (!hasManualApproval && covering.type === 'auto')) {
         mark.dataset.role = 'current-title';
         if (!scrollTarget) scrollTarget = mark;
+      } else if (!scrollTarget && covering.type === 'issue-date') {
+        scrollTarget = mark;
       }
       mark.textContent = segmentText;
       element.appendChild(mark);
@@ -1299,15 +1498,44 @@
     });
 
     applyCategoryPriorities(results);
+    const derivedSuggestions = applyLegalCombinationRules(results, clean);
+    applyAdministrativeMorphologyRule(results, clean);
     results.sort((a, b) => b.score - a.score || a.id - b.id);
 
     const mainCandidates = results.filter((item) => !item.additional);
     const top = mainCandidates[0] || null;
     const best = top && top.score >= 70 ? top : null;
     const second = mainCandidates.find((item) => !best || item.id !== best.id) || null;
-    const additional = best
+    let additional = best
       ? results.filter((item) => item.score >= 50 && item.id !== best.id).slice(0, 3)
       : [];
+
+    // Jawne odmiany słów „prawo” i „administracja/urzędnik” mają być zawsze
+    // widoczne w końcowej sugestii, nawet gdy przy bardzo złożonym tytule
+    // wypadłyby poza trzy najwyższe kategorie dodatkowe.
+    if (best) {
+      const mandatoryIds = [];
+      if (titleContainsLawMorphology(clean)) mandatoryIds.push(8);
+      if (titleContainsAdministrativeMorphology(clean)) mandatoryIds.push(6);
+      const mandatory = mandatoryIds
+        .map((categoryId) => results.find((item) => item.id === categoryId && item.score >= 50))
+        .filter((item) => item && item.id !== best.id);
+      const mandatoryIdSet = new Set(mandatory.map((item) => item.id));
+      const regular = results.filter((item) => item.score >= 50 && item.id !== best.id && !mandatoryIdSet.has(item.id));
+      additional = [...mandatory, ...regular]
+        .filter((item, index, array) => array.findIndex((candidate) => candidate.id === item.id) === index)
+        .sort((a, b) => b.score - a.score || a.id - b.id)
+        .slice(0, 3);
+      // Jeżeli sortowanie wyrzuciło kategorię obowiązkową, wymień najsłabszą
+      // zwykłą pozycję, zachowując limit maksymalnie 3 kategorii dodatkowych.
+      for (const must of mandatory) {
+        if (additional.some((item) => item.id === must.id)) continue;
+        const replaceIndex = [...additional].reverse().findIndex((item) => !mandatoryIdSet.has(item.id));
+        if (replaceIndex >= 0) additional.splice(additional.length - 1 - replaceIndex, 1, must);
+        else if (additional.length < 3) additional.push(must);
+      }
+      additional.sort((a, b) => b.score - a.score || a.id - b.id);
+    }
 
     const topScore = top?.score || 0;
     let level = 'niska';
@@ -1330,6 +1558,7 @@
       results: results.slice(0, 10),
       closestPublic,
       closestUser,
+      derivedSuggestions,
       knowledge: knowledgeSummary()
     };
   }
@@ -1628,6 +1857,380 @@
     return null;
   }
 
+  function normalizujEtykieteNatywna(wartosc) {
+    return normalizeUiText(wartosc)
+      .replace(/^\*+\s*/, '')
+      .replace(/\s*:\s*$/, '')
+      .trim();
+  }
+
+  function selektoryChronionychKontrolek() {
+    return [
+      'select[name="params[act]"]',
+      'input[name="params[sort]"]',
+      'input[name="params[name]"]',
+      '#todo_add',
+      'a.btn_normal3[title="Anuluj"]',
+      'a[href*="ref.php?show="]'
+    ];
+  }
+
+  function znajdzEtykieteNatywna(tekstEtykiety) {
+    const oczekiwanyTekst = normalizujEtykieteNatywna(tekstEtykiety);
+    return [...document.querySelectorAll('#forma div.input_bgt_o, #forma div.input_bgt, #forma label, #forma td, #forma th')]
+      .find((element) => {
+        if (element.closest('#semper-inline-categories, .semper-original-preview, #semper-ocr-panel')) return false;
+        const tekst = normalizujEtykieteNatywna(element.textContent || '');
+        return tekst === oczekiwanyTekst || tekst.startsWith(`${oczekiwanyTekst} `);
+      }) || null;
+  }
+
+  function znajdzPrzodkow(element) {
+    const formularz = document.getElementById('forma');
+    const przodkowie = [];
+    let biezacy = element;
+    while (biezacy && biezacy !== formularz) {
+      przodkowie.push(biezacy);
+      biezacy = biezacy.parentElement;
+    }
+    return przodkowie;
+  }
+
+  function czyBezpiecznyKontenerDoUkrycia(kontener, wlasneKontrolki = []) {
+    if (!kontener) return false;
+    return !selektoryChronionychKontrolek().some((selektor) => {
+      const element = kontener.matches?.(selektor) ? kontener : kontener.querySelector?.(selektor);
+      return element && !wlasneKontrolki.includes(element);
+    });
+  }
+
+  function znajdzKontenerPola(kontrolki, etykieta = null) {
+    const elementyPola = [...new Set([etykieta, ...kontrolki].filter(Boolean))];
+    if (!elementyPola.length) return null;
+
+    // Kontener wybieramy dopiero po potwierdzeniu, że zawiera komplet elementów
+    // jednego pola i żadną z kontrolek, które muszą pozostać widoczne.
+    for (const kandydat of znajdzPrzodkow(elementyPola[0])) {
+      if (!elementyPola.every((element) => kandydat.contains(element))) continue;
+      if (!czyBezpiecznyKontenerDoUkrycia(kandydat, kontrolki)) continue;
+      return kandydat;
+    }
+    return null;
+  }
+
+  function ukryjElement(element) {
+    if (!element) return;
+    element.classList.add('semper-ukryty-element-natywny');
+    element.setAttribute('aria-hidden', 'true');
+    element.style.setProperty('display', 'none', 'important');
+  }
+
+  function ukryjKontenerPola(kontener) {
+    if (!kontener) return false;
+    kontener.classList.add('semper-ukryte-pole-natywne');
+    kontener.setAttribute('aria-hidden', 'true');
+    kontener.style.setProperty('display', 'none', 'important');
+    return true;
+  }
+
+  function ukryjBezposredniKontenerKontrolki(kontrolka, selektorKontenera) {
+    const kontener = kontrolka?.parentElement;
+    if (!kontener?.matches(selektorKontenera)) return false;
+    if (!czyBezpiecznyKontenerDoUkrycia(kontener, [kontrolka])) return false;
+    return ukryjKontenerPola(kontener);
+  }
+
+  function przywrocWidocznoscElementu(element) {
+    if (!element) return;
+    const formularz = document.getElementById('forma');
+    for (const przodek of znajdzPrzodkow(element)) {
+      przodek.hidden = false;
+      przodek.removeAttribute('aria-hidden');
+      przodek.classList.remove(
+        'semper-native-edit-row-hidden',
+        'semper-native-preview-row-hidden',
+        'semper-original-text-editor-hidden',
+        'semper-hidden-native-label',
+        'semper-native-editor-widget-hidden',
+        'semper-native-mini-preview-content-hidden',
+        'semper-ukryte-pole-natywne',
+        'semper-ukryty-element-natywny'
+      );
+      if (przodek.style?.getPropertyValue('display') === 'none') przodek.style.removeProperty('display');
+      if (przodek === formularz) break;
+    }
+  }
+
+  function przywrocChronioneElementyFormularza() {
+    if (!location.pathname.endsWith('/wavepanel/ref_adm.php')) return;
+    const elementy = [
+      document.querySelector('#forma select[name="params[act]"]'),
+      document.querySelector('#forma input[name="params[sort]"]'),
+      document.querySelector('#forma input[name="params[name]"]'),
+      document.querySelector('#forma #todo_add'),
+      document.querySelector('#forma a.btn_normal3[title="Anuluj"], #forma a[href*="ref.php?show="]')
+    ];
+    elementy.forEach(przywrocWidocznoscElementu);
+  }
+
+  function ukryjPoleNatywne(etykietaTekst, kontrolki) {
+    const etykieta = znajdzEtykieteNatywna(etykietaTekst);
+    const kontener = etykieta && kontrolki.length ? znajdzKontenerPola(kontrolki, etykieta) : null;
+    if (ukryjKontenerPola(kontener)) return true;
+
+    // Brak indywidualnego kontenera nie upoważnia do ukrywania rodzica.
+    // Wtedy chowamy jedynie dokładnie rozpoznaną etykietę i kontrolkę.
+    ukryjElement(etykieta);
+    kontrolki.forEach(ukryjElement);
+    return Boolean(etykieta || kontrolki.length);
+  }
+
+  function kontrolkiFckEditora() {
+    const formularz = document.getElementById('forma');
+    if (!formularz) return [];
+    return [
+      document.getElementById('params[des]'),
+      document.getElementById('params[des]___Config'),
+      document.getElementById('params[des]___Frame'),
+      formularz.querySelector('iframe[src*="InstanceName=params[des]"]')
+    ].filter(Boolean);
+  }
+
+  function ramkiFckEditora() {
+    const formularz = document.getElementById('forma');
+    return [
+      document.getElementById('params[des]___Frame'),
+      formularz?.querySelector('iframe[src*="InstanceName=params[des]"]')
+    ].filter(Boolean);
+  }
+
+  function znajdzKontenerEdytoraOpisu(kontrolki, etykieta) {
+    const kontenerPola = znajdzKontenerPola(kontrolki, etykieta);
+    if (kontenerPola) return kontenerPola;
+
+    // Jeżeli etykieta i ramka nie mają wspólnego małego kontenera, szukamy
+    // wyłącznie opakowania samego FCKEditora, nadal z ochroną pól formularza.
+    for (const kandydat of znajdzPrzodkow(kontrolki[0])) {
+      if (kandydat === kontrolki[0]) continue;
+      if (!czyBezpiecznyKontenerDoUkrycia(kandydat, kontrolki)) continue;
+      if (!kandydat.querySelector('#params\\[des\\], #params\\[des\\]___Config, #params\\[des\\]___Frame, iframe[src*="InstanceName=params[des]"]')) continue;
+      return kandydat;
+    }
+    return null;
+  }
+
+  function ukryjNatywnyEdytorOpisu() {
+    const etykieta = znajdzEtykieteNatywna('Tekst');
+    const kontrolki = kontrolkiFckEditora();
+    if (!etykieta && !kontrolki.length) return false;
+
+    const kontener = kontrolki.length ? znajdzKontenerEdytoraOpisu(kontrolki, etykieta) : null;
+    if (ukryjKontenerPola(kontener)) return true;
+
+    ukryjElement(etykieta);
+    kontrolki.forEach(ukryjElement);
+    return true;
+  }
+
+  function mediaNatywnegoPodgladu() {
+    return [...document.querySelectorAll('#forma img[src*="/__template/img/upload/"], #forma a[href*="/__template/img/upload/"], #forma [style*="background-image"]')]
+      .filter((element) => !element.closest('.semper-original-preview'));
+  }
+
+  function ukryjNatywnyPodgladZdjecia() {
+    const etykieta = document.querySelector('#forma #pody') || znajdzEtykieteNatywna('Podgląd zdjęcia');
+    const media = mediaNatywnegoPodgladu();
+    const miniatura = document.querySelector('#forma #thumb2');
+    if (miniatura && czyBezpiecznyKontenerDoUkrycia(miniatura)) ukryjKontenerPola(miniatura);
+    const kontener = etykieta && media.length ? znajdzKontenerPola(media, etykieta) : null;
+    if (ukryjKontenerPola(kontener)) return true;
+
+    ukryjElement(etykieta);
+    media.forEach(ukryjElement);
+    return Boolean(etykieta || media.length);
+  }
+
+  function skompaktujNatywnyFormularzReferencji() {
+    if (!location.pathname.endsWith('/wavepanel/ref_adm.php')) return;
+    przywrocChronioneElementyFormularza();
+
+    const aliasy = [...document.querySelectorAll('#forma input[name="params[alias]"], #forma input[name*="[alias]"]')];
+    aliasy.forEach((alias) => ukryjBezposredniKontenerKontrolki(alias, 'div.input_bg'));
+    ukryjPoleNatywne('Alias', aliasy);
+
+    const polaPlikow = [...document.querySelectorAll('#forma input[type="file"]')];
+    polaPlikow.forEach((polePliku) => ukryjBezposredniKontenerKontrolki(polePliku, 'div.input_bg'));
+    ukryjPoleNatywne('Zdjęcie', polaPlikow);
+    ukryjNatywnyPodgladZdjecia();
+    ukryjNatywnyEdytorOpisu();
+
+    // Wavepanel ma wysoką, samodzielną komórkę etykiety opisu.
+    // Ukrywamy wyłącznie jej dokładny element, potwierdzony po tekście „Tekst”.
+    document.querySelectorAll('#forma div.input_bgt_o').forEach((etykieta) => {
+      if (normalizujEtykieteNatywna(etykieta.textContent || '') === 'tekst') ukryjElement(etykieta);
+    });
+  }
+
+  function znajdzWierszDoWstawienia(element) {
+    return znajdzPrzodkow(element).find((przodek) => przodek.tagName === 'TR') || null;
+  }
+
+  function znajdzKotwicePodgladu() {
+    const etykietaTekstu = znajdzEtykieteNatywna('Tekst');
+    const kontrolkiEdytora = kontrolkiFckEditora();
+    const kontenerEdytora = kontrolkiEdytora.length
+      ? znajdzKontenerEdytoraOpisu(kontrolkiEdytora, etykietaTekstu)
+      : null;
+    if (kontenerEdytora?.parentNode) return kontenerEdytora;
+
+    const etykietaPodgladu = document.querySelector('#forma #pody') || znajdzEtykieteNatywna('Podgląd zdjęcia');
+    const media = mediaNatywnegoPodgladu();
+    const kontenerPodgladu = etykietaPodgladu && media.length ? znajdzKontenerPola(media, etykietaPodgladu) : null;
+    if (kontenerPodgladu?.parentNode) return kontenerPodgladu;
+
+    // Pasek akcji jest osobnym, znanym punktem formularza; wstawiamy podgląd przed nim.
+    return znajdzWierszDoWstawienia(document.getElementById('todo_add'));
+  }
+
+  function znajdzKomorkiUkladuPodgladu() {
+    const komorkaMenu = document.querySelector('td#menu');
+    let komorkaFormularza = komorkaMenu?.nextElementSibling;
+    if (komorkaFormularza?.id === 'semper-original-preview-host') komorkaFormularza = komorkaFormularza.nextElementSibling;
+    if (!komorkaFormularza?.querySelector('#forma')) return null;
+    return { komorkaMenu, komorkaFormularza };
+  }
+
+  function utworzLubAktualizujPodgladOryginalu(adresObrazu) {
+    if (!location.pathname.endsWith('/wavepanel/ref_adm.php')) return false;
+    skompaktujNatywnyFormularzReferencji();
+
+    let hostPodgladu = document.getElementById('semper-original-preview-host');
+    const komorkiUkladu = znajdzKomorkiUkladuPodgladu();
+    if (komorkiUkladu && (hostPodgladu?.tagName !== 'TD' || hostPodgladu.previousElementSibling !== komorkiUkladu.komorkaMenu)) {
+      // Usuwamy wyłącznie stary, należący do rozszerzenia host z wnętrza formularza.
+      hostPodgladu.remove();
+      hostPodgladu = null;
+    }
+
+    if (!hostPodgladu) {
+      let kontenerSekcji;
+      if (komorkiUkladu) {
+        hostPodgladu = document.createElement('td');
+        hostPodgladu.id = 'semper-original-preview-host';
+        hostPodgladu.className = 'semper-original-preview-layout-cell';
+        komorkiUkladu.komorkaMenu.parentNode.insertBefore(hostPodgladu, komorkiUkladu.komorkaFormularza);
+        kontenerSekcji = hostPodgladu;
+      } else {
+        const celKategorii = findCategoryInsertTarget();
+        const kotwicaKategorii = celKategorii?.anchor?.parentNode ? celKategorii.anchor : null;
+        const kotwica = kotwicaKategorii || znajdzKotwicePodgladu();
+        if (!kotwica?.parentNode) return false;
+
+        const wiersz = kotwica.tagName === 'TR' ? kotwica : znajdzWierszDoWstawienia(kotwica);
+        hostPodgladu = document.createElement(wiersz ? 'tr' : 'div');
+        hostPodgladu.id = 'semper-original-preview-host';
+        kontenerSekcji = hostPodgladu;
+        if (wiersz) {
+          const komorka = document.createElement('td');
+          const liczbaKolumn = directCells(wiersz).reduce((suma, komorkaWiersza) => suma + Math.max(1, Number(komorkaWiersza.colSpan) || 1), 0);
+          komorka.colSpan = Math.max(2, liczbaKolumn || directCells(wiersz).length || 2);
+          komorka.className = 'semper-original-preview-cell';
+          hostPodgladu.appendChild(komorka);
+          kontenerSekcji = komorka;
+        } else {
+          hostPodgladu.className = 'semper-original-preview-host';
+        }
+        const kotwicaWstawienia = wiersz || kotwica;
+        kotwicaWstawienia.parentNode.insertBefore(hostPodgladu, kotwicaKategorii ? kotwicaWstawienia.nextSibling : kotwicaWstawienia);
+      }
+
+      const sekcja = document.createElement('section');
+      sekcja.className = 'semper-original-preview';
+      const naglowek = document.createElement('header');
+      const tytul = document.createElement('strong');
+      tytul.textContent = 'Podgląd oryginału:';
+      const otworz = document.createElement('a');
+      otworz.className = 'semper-original-preview-open';
+      otworz.target = '_blank';
+      otworz.rel = 'noopener';
+      otworz.textContent = 'Otwórz oryginał';
+      naglowek.append(tytul, otworz);
+
+      const obraz = document.createElement('img');
+      obraz.alt = 'Pełnowymiarowy podgląd oryginalnego pliku referencji';
+      obraz.loading = 'eager';
+      sekcja.append(naglowek, obraz);
+      kontenerSekcji.appendChild(sekcja);
+    }
+
+    const obraz = hostPodgladu.querySelector('.semper-original-preview img');
+    const otworz = hostPodgladu.querySelector('.semper-original-preview-open');
+    if (adresObrazu) {
+      if (obraz) obraz.src = adresObrazu;
+      if (otworz) {
+        otworz.href = adresObrazu;
+        otworz.hidden = false;
+      }
+    } else if (otworz) {
+      otworz.hidden = true;
+    }
+    return true;
+  }
+
+  function czyElementWidoczny(element) {
+    if (!element || !element.isConnected) return false;
+    for (const przodek of [element, ...znajdzPrzodkow(element)]) {
+      const style = getComputedStyle(przodek);
+      if (przodek.hidden || style.display === 'none' || style.visibility === 'hidden') return false;
+    }
+    return true;
+  }
+
+  function validateEditFormLayout() {
+    if (!location.pathname.endsWith('/wavepanel/ref_adm.php')) return true;
+
+    const wymagane = {
+      aktywne: document.querySelector('#forma select[name="params[act]"]'),
+      sortowanie: document.querySelector('#forma input[name="params[sort]"]'),
+      nazwa: document.querySelector('#forma input[name="params[name]"]'),
+      zapisz: document.querySelector('#forma #todo_add'),
+      poZapisie: document.querySelector('#semper-after-save-sort-control'),
+      podgladOryginalu: document.querySelector('.semper-original-preview')
+    };
+    const niewidoczne = {
+      alias: document.querySelector('#forma input[name="params[alias]"], #forma input[name*="[alias]"]'),
+      plik: document.querySelector('#forma input[type="file"]'),
+      podgladZdjecia: document.querySelector('#forma #thumb2, #forma #pody') || znajdzEtykieteNatywna('Podgląd zdjęcia'),
+      fckEditor: ramkiFckEditora()[0] || null,
+      tekst: znajdzEtykieteNatywna('Tekst')
+    };
+    const bledyWidocznosci = Object.entries(wymagane).filter(([, element]) => !czyElementWidoczny(element));
+    const bledyUkrycia = Object.entries(niewidoczne).filter(([, element]) => element && czyElementWidoczny(element));
+
+    if (!bledyWidocznosci.length && !bledyUkrycia.length) return true;
+    console.error('[SEMPER OCR] Błąd układu formularza', {
+      ukryteElementyChronione: bledyWidocznosci.map(([nazwa]) => nazwa),
+      widoczneElementyDoUkrycia: bledyUkrycia.map(([nazwa]) => nazwa)
+    });
+    bledyWidocznosci.forEach(([, element]) => przywrocWidocznoscElementu(element));
+    return false;
+  }
+
+  function utrzymajNatywnyEdytorOpisuUkryty(adresObrazu) {
+    if (!location.pathname.endsWith('/wavepanel/ref_adm.php')) return;
+    utworzLubAktualizujPodgladOryginalu(adresObrazu);
+
+    // FCKEditor może powstać po document_idle. Obserwator wykonuje wyłącznie
+    // bezpieczne ukrycie edytora i kończy pracę zaraz po sukcesie.
+    const obserwator = new MutationObserver(() => {
+      if (!ramkiFckEditora().length) return;
+      if (ukryjNatywnyEdytorOpisu()) obserwator.disconnect();
+    });
+    obserwator.observe(document.body, { childList: true, subtree: true });
+    if (ramkiFckEditora().length && ukryjNatywnyEdytorOpisu()) obserwator.disconnect();
+    window.setTimeout(() => obserwator.disconnect(), 15000);
+  }
+
   function categorySuggestionIds(record) {
     const classification = record?.classification;
     return new Set([classification?.best, ...(classification?.additional || [])]
@@ -1694,7 +2297,6 @@
           <button type="button" class="semper-ocr-btn" data-action="refresh-categories">Odśwież</button>
         </div>
         <span class="semper-inline-category-status" data-role="category-status">Wczytywanie…</span>
-        <span class="semper-daily-category-counter" data-compact="1">Dzisiaj: …</span>
       </div>
       <div class="semper-inline-category-hint" data-role="category-suggestion-hint">Sprawdzam sugestie OCR…</div>
       <div class="semper-inline-category-grid" data-role="category-grid"></div>
@@ -2577,6 +3179,18 @@
       }
     }
 
+    if (classification?.derivedSuggestions?.length) {
+      const derived = document.createElement('div');
+      derived.className = 'semper-ocr-derived-suggestions';
+      for (const suggestion of classification.derivedSuggestions) {
+        const item = document.createElement('div');
+        item.className = 'semper-ocr-derived-suggestion';
+        item.textContent = `Reguła łączona: ${suggestion.name} (${suggestion.score}/100)${suggestion.note ? ` – ${suggestion.note}` : ''}`;
+        derived.appendChild(item);
+      }
+      container.appendChild(derived);
+    }
+
     const meta = document.createElement('div');
     meta.className = 'semper-ocr-status';
     const topScore = classification?.top?.score || 0;
@@ -2602,7 +3216,7 @@
     const knowledge = classification?.knowledge || knowledgeSummary();
     const sourceMeta = document.createElement('div');
     sourceMeta.className = 'semper-ocr-status';
-    sourceMeta.textContent = `Klasyfikator 3.0 · baza SEMPER: ${knowledge.publicCount || 0} wzorców · Twoje zatwierdzone przykłady: ${knowledge.userCount || 0}${knowledge.pending ? ` · do zindeksowania: ${knowledge.pending}` : ''}.`;
+    sourceMeta.textContent = `Klasyfikator 3.2 · baza SEMPER: ${knowledge.publicCount || 0} wzorców · Twoje zatwierdzone przykłady: ${knowledge.userCount || 0}${knowledge.pending ? ` · do zindeksowania: ${knowledge.pending}` : ''}.`;
     container.appendChild(sourceMeta);
 
     if (classification?.closestPublic?.title && classification.closestPublic.similarity >= 0.46) {
@@ -2612,6 +3226,103 @@
       similar.title = classification.closestPublic.url || '';
       container.appendChild(similar);
     }
+  }
+
+  function defaultAfterSaveSortValue() {
+    return localCompactDateKey();
+  }
+
+  async function enhanceSortFieldWithAfterSaveControl() {
+    if (!location.pathname.endsWith('/wavepanel/ref_adm.php')) return null;
+    skompaktujNatywnyFormularzReferencji();
+    const sortInput = document.querySelector('input[name="params[sort]"]');
+    if (!sortInput) return null;
+
+    let control = document.getElementById('semper-after-save-sort-control');
+    if (control) return control.querySelector('input[data-role="after-save-sort"]');
+
+    const today = defaultAfterSaveSortValue();
+    const stored = await chrome.storage.local.get(AFTER_SAVE_SORT_KEY);
+    const storedValue = stored[AFTER_SAVE_SORT_KEY];
+    const initialValue = storedValue && typeof storedValue === 'object' && storedValue.dateKey === today
+      ? String(storedValue.value || today).trim() || today
+      : today;
+
+    sortInput.classList.add('semper-native-sort-input');
+
+    let wrapper = sortInput.closest('.semper-sort-with-after-save');
+    if (!wrapper) {
+      wrapper = document.createElement('div');
+      wrapper.className = 'semper-sort-with-after-save';
+      sortInput.parentNode.insertBefore(wrapper, sortInput);
+      wrapper.appendChild(sortInput);
+    }
+
+    control = document.createElement('span');
+    control.id = 'semper-after-save-sort-control';
+    control.className = 'semper-after-save-sort-control';
+
+    const label = document.createElement('label');
+    label.className = 'semper-after-save-sort-label';
+    label.textContent = 'Po zapisie:';
+
+    const afterSaveInput = document.createElement('input');
+    afterSaveInput.type = 'text';
+    afterSaveInput.inputMode = 'text';
+    afterSaveInput.autocomplete = 'off';
+    afterSaveInput.className = 'semper-after-save-sort-input';
+    afterSaveInput.dataset.role = 'after-save-sort';
+    afterSaveInput.value = initialValue;
+    afterSaveInput.placeholder = 'RRMMDD';
+    afterSaveInput.title = 'Domyślnie dzisiejsza data w formacie RRMMDD (np. 260728). Tę wartość można ręcznie zmienić przed aktualizacją.';
+
+    afterSaveInput.addEventListener('change', async () => {
+      const value = String(afterSaveInput.value || '').trim() || defaultAfterSaveSortValue();
+      afterSaveInput.value = value;
+      await chrome.storage.local.set({ [AFTER_SAVE_SORT_KEY]: { dateKey: localDateKey(), value } });
+    });
+
+    control.append(label, afterSaveInput);
+    wrapper.appendChild(control);
+    return afterSaveInput;
+  }
+
+  async function updateReferenceAndSubmit(afterSaveInput, button) {
+    if (!location.pathname.endsWith('/wavepanel/ref_adm.php')) return;
+    const sortInput = document.querySelector('input[name="params[sort]"]');
+    const form = document.getElementById('forma') || sortInput?.closest('form');
+    if (!sortInput || !form) {
+      window.alert('Nie znaleziono pola „Sortowanie” lub formularza referencji.');
+      return;
+    }
+
+    const fallback = defaultAfterSaveSortValue();
+    const value = String(afterSaveInput?.value || fallback).trim() || fallback;
+    if (afterSaveInput) afterSaveInput.value = value;
+    await chrome.storage.local.set({ [AFTER_SAVE_SORT_KEY]: { dateKey: localDateKey(), value } });
+
+    sortInput.value = value;
+    sortInput.setAttribute('value', value);
+    sortInput.dispatchEvent(new Event('input', { bubbles: true }));
+    sortInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+    if (button) {
+      button.disabled = true;
+      button.textContent = 'Aktualizuję…';
+    }
+
+    // Korzystamy z natywnego przycisku Wavepanelu, aby zachować jego standardową logikę zapisu.
+    const nativeSave = document.getElementById('todo_add');
+    if (nativeSave) {
+      nativeSave.click();
+      return;
+    }
+
+    if (typeof form.requestSubmit === 'function') {
+      form.requestSubmit();
+      return;
+    }
+    HTMLFormElement.prototype.submit.call(form);
   }
 
   async function buildAnalysisPanel(id, imageUrl, initialRecord = null) {
@@ -2628,11 +3339,19 @@
     panelHeader.className = 'semper-ocr-panel-header';
     const heading = document.createElement('h2');
     heading.textContent = `OCR REFERENCJI${id ? ` #${id}` : ''}`;
+    const headerActions = document.createElement('div');
+    headerActions.className = 'semper-ocr-panel-header-actions';
+    const updateReference = makeButton('Zaktualizuj referencje');
+    updateReference.classList.add('success', 'semper-ocr-update-reference-btn');
+    updateReference.hidden = !location.pathname.endsWith('/wavepanel/ref_adm.php');
+    const headerDailyCounter = makeDailyCategoryCounter(true);
+    headerDailyCounter.classList.add('semper-ocr-header-daily-counter');
     const collapse = document.createElement('button');
     collapse.type = 'button';
     collapse.className = 'semper-ocr-collapse-btn';
     collapse.setAttribute('aria-label', 'Zwiń panel OCR');
-    panelHeader.append(heading, collapse);
+    headerActions.append(updateReference, headerDailyCounter, collapse);
+    panelHeader.append(heading, headerActions);
 
     const panelBody = document.createElement('div');
     panelBody.className = 'semper-ocr-panel-body';
@@ -2649,10 +3368,21 @@
     const titleInput = document.createElement('textarea');
     titleInput.className = 'semper-ocr-title-input';
     titleInput.placeholder = 'Wykryty lub ręcznie poprawiony tytuł szkolenia';
+    const titleSaveRow = document.createElement('div');
+    titleSaveRow.className = 'semper-ocr-field-save-row';
+    const save = makeButton('Zapisz tytuł', true);
+    save.classList.add('semper-ocr-save-title-btn');
+    titleSaveRow.appendChild(save);
 
     const issueDateLabel = document.createElement('div');
-    issueDateLabel.className = 'semper-ocr-label';
-    issueDateLabel.textContent = 'Data wystawienia dokumentu:';
+    issueDateLabel.className = 'semper-ocr-label semper-ocr-date-label';
+    const issueDateLabelText = document.createElement('span');
+    issueDateLabelText.textContent = 'Data wystawienia dokumentu:';
+    const issueDateApprovalBadge = document.createElement('span');
+    issueDateApprovalBadge.className = 'semper-ocr-date-approved-badge';
+    issueDateApprovalBadge.textContent = '✓ Zatwierdzona ręcznie';
+    issueDateApprovalBadge.hidden = true;
+    issueDateLabel.append(issueDateLabelText, issueDateApprovalBadge);
     const issueDateRow = document.createElement('div');
     issueDateRow.className = 'semper-ocr-date-editor';
     const issueDateInput = document.createElement('input');
@@ -2663,9 +3393,11 @@
     const noIssueDate = document.createElement('input');
     noIssueDate.type = 'checkbox';
     noIssueDateLabel.append(noIssueDate, document.createTextNode(' Brak'));
+    const saveIssueDate = makeButton('Zapisz datę');
+    saveIssueDate.classList.add('semper-ocr-save-date-btn');
     const issueDateHint = document.createElement('span');
     issueDateHint.className = 'semper-ocr-date-hint';
-    issueDateRow.append(issueDateInput, noIssueDateLabel, issueDateHint);
+    issueDateRow.append(issueDateInput, noIssueDateLabel, saveIssueDate);
 
     const status = document.createElement('div');
     status.className = 'semper-ocr-status';
@@ -2677,12 +3409,14 @@
     const ocrLabel = document.createElement('div');
     ocrLabel.className = 'semper-ocr-label';
     ocrLabel.textContent = 'Pełny tekst OCR:';
+    const rerun = makeButton('Uruchom OCR ponownie');
+    rerun.classList.add('semper-ocr-rerun-inline');
     const toggleOcr = makeButton('▲ Ukryj OCR');
     toggleOcr.classList.add('semper-ocr-text-toggle');
     toggleOcr.setAttribute('aria-expanded', 'true');
     const ocrSectionHeader = document.createElement('div');
     ocrSectionHeader.className = 'semper-ocr-full-text-header';
-    ocrSectionHeader.append(ocrLabel, toggleOcr);
+    ocrSectionHeader.append(ocrLabel, rerun, toggleOcr);
 
     const ocrText = document.createElement('div');
     ocrText.className = 'semper-ocr-text';
@@ -2697,19 +3431,26 @@
 
     const actions = document.createElement('div');
     actions.className = 'semper-ocr-actions semper-ocr-actions-bottom';
-    const save = makeButton('Zapisz tytuł', true);
-    const rerun = makeButton('Uruchom OCR ponownie');
-    const useSelection = makeButton('Użyj zaznaczenia OCR');
+    const useSelection = makeButton('Użyj zaznaczony tytuł');
     useSelection.classList.add('success');
-    actions.append(useSelection, rerun, save);
+    const useDateSelection = makeButton('Użyj zaznaczoną datę');
+    useDateSelection.classList.add('semper-ocr-use-date-selection');
+    const selectionActions = document.createElement('div');
+    selectionActions.className = 'semper-ocr-selection-actions';
+    selectionActions.append(useSelection, useDateSelection);
+    actions.append(selectionActions);
 
-    panelBody.append(titleLabel, titleInput, issueDateLabel, issueDateRow, status, classificationBox, ocrSection, actions);
+    panelBody.append(titleLabel, titleInput, titleSaveRow, issueDateLabel, issueDateRow, issueDateHint, status, classificationBox, ocrSection, actions);
     panel.append(resizeHandle, panelHeader, panelBody);
 
     const basePaddingRight = Math.max(0, Number.parseFloat(getComputedStyle(document.body).paddingRight) || 0);
     document.body.style.setProperty('--semper-ocr-base-padding-right', `${basePaddingRight}px`);
     document.body.classList.add('semper-ocr-sidebar-active');
     document.body.appendChild(panel);
+
+    const afterSaveSortInput = await enhanceSortFieldWithAfterSaveControl();
+    validateEditFormLayout();
+    updateReference.addEventListener('click', () => updateReferenceAndSubmit(afterSaveSortInput, updateReference));
 
     const ui = await chrome.storage.local.get([PANEL_WIDTH_KEY, PANEL_COLLAPSED_KEY]);
     const maxWidth = () => Math.max(PANEL_MIN_WIDTH, Math.min(920, window.innerWidth - 64));
@@ -2779,6 +3520,7 @@
     let savedOcrValue = '';
     let savedIssueDateValue = '';
     let savedIssueDateState = 'undetected';
+    let approvedIssueDateSignature = '';
     let panelSelectedCategoryIds = new Set();
     let panelSavedCategoryIds = new Set();
     let panelCategorySelectionTouched = false;
@@ -2889,10 +3631,22 @@
       return noIssueDate.checked ? 'none' : (issueDateInput.value ? 'date' : 'undetected');
     }
 
+    function currentIssueDateSignature() {
+      return `${currentIssueDateState()}:${issueDateInput.value || ''}`;
+    }
+
+    function updateIssueDateApprovalStyle() {
+      const approved = Boolean(approvedIssueDateSignature) && currentIssueDateSignature() === approvedIssueDateSignature;
+      issueDateInput.classList.toggle('manual-approved', approved);
+      noIssueDateLabel.classList.toggle('manual-approved', approved && noIssueDate.checked);
+      issueDateApprovalBadge.hidden = !approved;
+    }
+
     function updateEditorDirtyState() {
       setDirty(titleDirtyKey, cleanTitle(titleInput.value) !== savedTitleValue);
       setDirty(ocrDirtyKey, getEditableOcrText(ocrText) !== savedOcrValue);
       setDirty(issueDateDirtyKey, issueDateInput.value !== savedIssueDateValue || currentIssueDateState() !== savedIssueDateState);
+      updateIssueDateApprovalStyle();
     }
 
     function displayRecord() {
@@ -2902,16 +3656,22 @@
       const manualHighlight = record.manualTitle
         ? titleInput.value
         : (normalize(titleInput.value) !== normalize(record.detectedTitle || '') ? titleInput.value : '');
-      renderOcrWithHighlights(ocrText, record.ocrText || '', record.detectedTitle || record.title || '', manualHighlight);
       const issueState = record.issueDateState || (record.issueDate ? 'date' : 'undetected');
       issueDateInput.value = issueState === 'date' ? (record.issueDate || '') : '';
       noIssueDate.checked = issueState === 'none';
       issueDateInput.disabled = noIssueDate.checked;
+      approvedIssueDateSignature = (record.issueDateSource === 'manual' || record.issueDateApprovedAt)
+        ? `${issueState}:${issueState === 'date' ? (record.issueDate || '') : ''}`
+        : '';
       issueDateHint.textContent = issueState === 'none'
-        ? 'Dokument oznaczony jako bez daty wystawienia.'
+        ? (approvedIssueDateSignature ? '' : 'Dokument oznaczony jako bez daty wystawienia.')
         : record.issueDate
-          ? `${record.issueDateSource === 'manual' ? 'Ręcznie' : 'OCR'}${record.issueDateConfidence ? ` · ${record.issueDateConfidence}%` : ''}`
+          ? (record.issueDateSource === 'manual' ? '' : `OCR${record.issueDateConfidence ? ` · ${record.issueDateConfidence}%` : ''}`)
           : 'Niewykryta';
+      renderOcrWithHighlights(ocrText, record.ocrText || '', record.detectedTitle || record.title || '', manualHighlight, {
+        iso: record.issueDate || '',
+        raw: record.issueDateRaw || ''
+      });
       savedTitleValue = cleanTitle(titleInput.value);
       savedOcrValue = getEditableOcrText(ocrText);
       savedIssueDateValue = issueDateInput.value;
@@ -2959,8 +3719,6 @@
       const manualTitle = cleanTitle(titleInput.value);
       const currentOcrText = getEditableOcrText(ocrText);
       const classification = classify(manualTitle, currentOcrText);
-      const issueState = currentIssueDateState();
-      const issueDateChanged = issueDateInput.value !== savedIssueDateValue || issueState !== savedIssueDateState;
       record = {
         ...record,
         manualTitle,
@@ -2968,31 +3726,59 @@
         titleApprovalSource: 'manual-save',
         titleApprovedAt: Date.now(),
         ocrText: currentOcrText,
-        issueDate: issueState === 'date' ? issueDateInput.value : '',
-        issueDateState: issueState,
-        issueDateSource: issueState === 'undetected' ? '' : (issueDateChanged ? 'manual' : (record.issueDateSource || 'manual')),
-        issueDateConfidence: issueState === 'date' ? (issueDateChanged ? 100 : (record.issueDateConfidence || 100)) : 0,
-        issueDateRaw: issueState === 'date' ? (issueDateChanged ? issueDateInput.value : (record.issueDateRaw || issueDateInput.value)) : '',
         classification,
         classifierVersion: CLASSIFIER_VERSION
       };
       if (id) await saveRecord(id, record);
       titleInput.value = manualTitle;
       renderPanelClassification(classification);
-      const manualHighlight = normalize(manualTitle) !== normalize(record.detectedTitle || '') ? manualTitle : '';
-      renderOcrWithHighlights(ocrText, currentOcrText, record.detectedTitle || manualTitle || '', manualHighlight, false);
+      const manualHighlight = manualTitle || '';
+      renderOcrWithHighlights(ocrText, currentOcrText, record.detectedTitle || manualTitle || '', manualHighlight, {
+        iso: record.issueDate || issueDateInput.value || '',
+        raw: record.issueDateRaw || ''
+      }, false);
       approvedTitleValue = cleanTitle(manualTitle);
       savedTitleValue = cleanTitle(manualTitle);
       updateTitleApprovalStyle();
       savedOcrValue = getEditableOcrText(ocrText);
-      savedIssueDateValue = issueDateInput.value;
-      savedIssueDateState = currentIssueDateState();
-      issueDateHint.textContent = savedIssueDateState === 'none' ? 'Dokument oznaczony jako bez daty wystawienia.' : savedIssueDateValue ? 'Ręcznie · zapisano' : 'Niewykryta';
       updateEditorDirtyState();
       status.className = 'semper-ocr-status';
-      status.textContent = id ? `Zapisano tytuł i dane dokumentu dla referencji #${id}.` : 'Dane poprawiono, ale nie udało się ustalić ID referencji.';
+      status.textContent = id ? `Zapisano i ręcznie zatwierdzono tytuł referencji #${id}.` : 'Tytuł zatwierdzono ręcznie, ale nie udało się ustalić ID referencji.';
       announceRecordUpdate(id, record);
     });
+
+    async function persistIssueDate(source = 'manual-save', selectedRaw = '') {
+      const issueState = currentIssueDateState();
+      record = {
+        ...record,
+        issueDate: issueState === 'date' ? issueDateInput.value : '',
+        issueDateState: issueState,
+        issueDateSource: issueState === 'undetected' ? '' : 'manual',
+        issueDateConfidence: issueState === 'date' ? 100 : 0,
+        issueDateRaw: issueState === 'date' ? (selectedRaw || record.issueDateRaw || issueDateInput.value) : '',
+        issueDateApprovalSource: source,
+        issueDateApprovedAt: Date.now()
+      };
+      if (id) await saveRecord(id, record);
+      savedIssueDateValue = issueDateInput.value;
+      savedIssueDateState = issueState;
+      approvedIssueDateSignature = currentIssueDateSignature();
+      issueDateHint.textContent = '';
+      updateEditorDirtyState();
+      renderOcrWithHighlights(ocrText, getEditableOcrText(ocrText), record.detectedTitle || record.title || '', record.manualTitle || '', {
+        iso: record.issueDate || '',
+        raw: record.issueDateRaw || ''
+      }, false);
+      status.className = 'semper-ocr-status';
+      status.textContent = issueState === 'none'
+        ? `Zatwierdzono ręcznie brak daty wystawienia${id ? ` dla referencji #${id}` : ''}.`
+        : issueState === 'date'
+          ? `Zapisano i ręcznie zatwierdzono datę ${formatIssueDate(issueDateInput.value)}${id ? ` dla referencji #${id}` : ''}.`
+          : 'Data pozostaje niewykryta.';
+      announceRecordUpdate(id, record);
+    }
+
+    saveIssueDate.addEventListener('click', () => persistIssueDate('manual-save'));
 
     rerun.addEventListener('click', () => run(true));
     useSelection.addEventListener('click', async () => {
@@ -3001,7 +3787,7 @@
       const focusInside = selection?.focusNode && ocrText.contains(selection.focusNode);
       const selectedText = anchorInside && focusInside ? String(selection.toString() || '').trim() : '';
       if (!selectedText) {
-        status.textContent = 'Najpierw zaznacz fragment w polu pełnego OCR.';
+        status.textContent = 'Najpierw zaznacz fragment tytułu w polu pełnego OCR.';
         return;
       }
 
@@ -3024,7 +3810,10 @@
       savedTitleValue = manualTitle;
       updateTitleApprovalStyle();
       renderPanelClassification(classification);
-      renderOcrWithHighlights(ocrText, currentOcrText, record.detectedTitle || '', manualTitle, false);
+      renderOcrWithHighlights(ocrText, currentOcrText, record.detectedTitle || '', manualTitle, {
+        iso: record.issueDate || issueDateInput.value || '',
+        raw: record.issueDateRaw || ''
+      }, false);
       updateEditorDirtyState();
       status.className = 'semper-ocr-status';
       status.textContent = id
@@ -3032,6 +3821,28 @@
         : 'Zatwierdzono zaznaczony tytuł.';
       announceRecordUpdate(id, record);
     });
+
+    useDateSelection.addEventListener('click', async () => {
+      const selection = window.getSelection?.();
+      const anchorInside = selection?.anchorNode && ocrText.contains(selection.anchorNode);
+      const focusInside = selection?.focusNode && ocrText.contains(selection.focusNode);
+      const selectedText = anchorInside && focusInside ? String(selection.toString() || '').trim() : '';
+      if (!selectedText) {
+        status.textContent = 'Najpierw zaznacz datę w polu pełnego OCR.';
+        return;
+      }
+      const parsed = parseSelectedIssueDate(selectedText);
+      if (!parsed?.iso) {
+        status.className = 'semper-ocr-error';
+        status.textContent = 'Zaznaczony fragment nie wygląda jak prawidłowa data (np. 17.01.2020, 2020-01-17 albo 17 stycznia 2020).';
+        return;
+      }
+      issueDateInput.value = parsed.iso;
+      issueDateInput.disabled = false;
+      noIssueDate.checked = false;
+      await persistIssueDate('ocr-selection', parsed.raw || selectedText);
+    });
+
     toggleOcr.addEventListener('click', () => {
       const hidden = ocrText.hidden;
       ocrText.hidden = !hidden;
@@ -3041,16 +3852,16 @@
     issueDateInput.addEventListener('input', () => {
       if (issueDateInput.value) noIssueDate.checked = false;
       issueDateInput.disabled = false;
-      issueDateHint.textContent = issueDateInput.value ? 'Ręcznie zmieniona – zapisz dane.' : 'Niewykryta';
+      issueDateHint.textContent = issueDateInput.value ? 'Niezapisana zmiana – kliknij „Zapisz datę”.' : 'Niewykryta';
       updateEditorDirtyState();
     });
     noIssueDate.addEventListener('change', () => {
       issueDateInput.disabled = noIssueDate.checked;
       if (noIssueDate.checked) {
         issueDateInput.value = '';
-        issueDateHint.textContent = 'Brak daty – zapisz dane.';
+        issueDateHint.textContent = 'Brak daty – kliknij „Zapisz datę”.';
       } else {
-        issueDateHint.textContent = issueDateInput.value ? 'Ręcznie zmieniona – zapisz dane.' : 'Niewykryta';
+        issueDateHint.textContent = issueDateInput.value ? 'Niezapisana zmiana – kliknij „Zapisz datę”.' : 'Niewykryta';
       }
       updateEditorDirtyState();
     });
@@ -3061,8 +3872,11 @@
       renderPanelClassification(previewClassification);
       updateEditorDirtyState();
       updateTitleApprovalStyle();
-      const manualHighlight = normalize(titleInput.value) !== normalize(record.detectedTitle || '') ? titleInput.value : '';
-      renderOcrWithHighlights(ocrText, currentOcrText, record.detectedTitle || '', manualHighlight, false);
+      const manualHighlight = approvedTitleValue && normalize(titleInput.value) === normalize(approvedTitleValue) ? titleInput.value : '';
+      renderOcrWithHighlights(ocrText, currentOcrText, record.detectedTitle || '', manualHighlight, {
+        iso: record.issueDate || '',
+        raw: record.issueDateRaw || ''
+      }, false);
       announceRecordUpdate(id, { ...record, title: titleInput.value, classification: previewClassification });
     });
     ocrText.addEventListener('input', () => {
@@ -3101,6 +3915,7 @@
     if (initialRecord) initialRecord = await ensureRecordClassification(id, initialRecord);
 
     if (location.pathname.endsWith('/wavepanel/ref_adm.php') && id) {
+      utrzymajNatywnyEdytorOpisuUkryty(imageUrl);
       const results = await Promise.allSettled([
         buildAnalysisPanel(id, imageUrl, initialRecord),
         buildInlineCategoryEditor(id)

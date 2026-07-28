@@ -906,3 +906,564 @@ body.semper-ocr-sidebar-active.semper-ocr-sidebar-resizing {
   justify-content: flex-end;
   margin: 7px 0;
 }
+
+/* v0.3.7 – zatwierdzanie daty i niezależne zapisy pól */
+.semper-ocr-field-save-row {
+  display: flex;
+  justify-content: flex-end;
+  margin: 5px 0 2px;
+}
+
+.semper-ocr-field-save-row .semper-ocr-btn {
+  min-height: 27px;
+  padding: 4px 9px;
+  font-size: 11px;
+}
+
+.semper-ocr-date-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.semper-ocr-date-approved-badge {
+  padding: 2px 7px;
+  border: 1px solid #3f7f58;
+  border-radius: 999px;
+  background: #d8eadf;
+  color: #155c35;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+
+.semper-ocr-date-input.manual-approved {
+  border-color: #3d7e55;
+  background: #e0efe5;
+  color: #124f2d;
+  box-shadow: inset 3px 0 0 #2f704a;
+}
+
+.semper-ocr-no-date.manual-approved {
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: #e0efe5;
+  color: #124f2d;
+}
+
+.semper-ocr-date-editor {
+  grid-template-columns: minmax(145px, 1fr) auto auto !important;
+}
+
+.semper-ocr-save-date-btn {
+  min-height: 31px !important;
+  padding: 5px 9px !important;
+  white-space: nowrap;
+}
+
+.semper-ocr-date-hint {
+  display: block;
+  min-height: 14px;
+  margin-top: 3px;
+}
+
+/* v0.3.7 – daty w pełnym OCR */
+.semper-ocr-date-highlight,
+.semper-ocr-issue-date-highlight {
+  padding: 1px 2px;
+  border-radius: 2px;
+  font-weight: 700;
+}
+
+.semper-ocr-date-highlight {
+  background: #c9efff;
+  color: #123b55;
+  box-shadow: 0 0 0 1px rgba(30, 139, 190, .22);
+}
+
+.semper-ocr-issue-date-highlight {
+  background: #2f80d1;
+  color: #fff;
+  box-shadow: 0 0 0 1px rgba(16, 79, 145, .35);
+}
+
+/* v0.3.7 – akcje wyboru tytułu i daty */
+.semper-ocr-actions-bottom {
+  grid-template-columns: minmax(0, 1.35fr) minmax(130px, .8fr) !important;
+  align-items: stretch;
+}
+
+.semper-ocr-selection-actions {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  min-width: 0;
+}
+
+.semper-ocr-selection-actions .semper-ocr-btn,
+.semper-ocr-actions-bottom > .semper-ocr-btn {
+  width: 100%;
+}
+
+.semper-ocr-use-date-selection {
+  border-color: #6aa8d7 !important;
+  background: #eaf5fd !important;
+  color: #175c8d !important;
+}
+
+.semper-ocr-use-date-selection:hover {
+  background: #dceffc !important;
+}
+
+/* v0.3.7 – ręczna korekta dziennego licznika */
+.semper-daily-category-counter-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+
+.semper-daily-category-counter-wrap .semper-daily-category-counter {
+  margin: 0;
+}
+
+.semper-daily-counter-btn,
+.semper-daily-counter-reset {
+  box-sizing: border-box;
+  min-width: 27px;
+  min-height: 28px;
+  padding: 4px 7px;
+  border: 1px solid #a9c99a;
+  border-radius: 5px;
+  background: #f7fbf5;
+  color: #356b27;
+  cursor: pointer;
+  font: 700 12px/1.1 Arial, Helvetica, sans-serif;
+}
+
+.semper-daily-counter-reset {
+  min-width: auto;
+  font-size: 10px;
+}
+
+.semper-daily-counter-btn:hover,
+.semper-daily-counter-reset:hover {
+  background: #e4f2dd;
+}
+
+.semper-inline-category-header .semper-daily-category-counter-wrap {
+  margin-left: auto;
+}
+
+.semper-inline-category-header .semper-daily-counter-btn,
+.semper-inline-category-header .semper-daily-counter-reset {
+  min-height: 24px;
+  min-width: 23px;
+  padding: 3px 5px;
+  font-size: 10px;
+}
+
+/* v0.3.7 – ukrycie nieużywanego CKEditora „Tekst” i pełny podgląd referencji */
+tr.semper-original-text-editor-hidden {
+  display: none !important;
+}
+
+#semper-full-reference-preview-row > td.semper-full-reference-preview-cell {
+  padding: 6px 0 0 !important;
+  background: transparent !important;
+}
+
+.semper-full-reference-preview {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #c9d3df;
+  border-radius: 5px;
+  background: #f8fafc;
+  box-sizing: border-box;
+}
+
+.semper-full-reference-preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 7px;
+  color: #10233f;
+  font: 700 12px/1.2 Arial, Helvetica, sans-serif;
+}
+
+.semper-full-reference-preview-open {
+  color: #1d5d9f;
+  font-size: 11px;
+  text-decoration: underline;
+}
+
+.semper-full-reference-preview-body {
+  width: 100%;
+  min-height: 120px;
+  overflow: auto;
+  text-align: center;
+  background: #202020;
+  border-radius: 3px;
+}
+
+.semper-full-reference-preview-image {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+  background: #fff;
+}
+
+.semper-full-reference-preview-empty {
+  padding: 30px;
+  color: #e2e8f0;
+  text-align: center;
+}
+
+/* v0.3.7 – informacja o regułach łączonych klasyfikatora */
+.semper-ocr-derived-suggestions {
+  margin-top: 7px;
+  padding: 6px 7px;
+  border-left: 3px solid #6a9cc8;
+  background: #eef6fc;
+  color: #34526c;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.semper-ocr-derived-suggestion + .semper-ocr-derived-suggestion {
+  margin-top: 3px;
+}
+
+/* v0.3.8 – akcje w nagłówku panelu OCR */
+.semper-ocr-panel-header {
+  gap: 8px;
+}
+
+.semper-ocr-panel-header > h2 {
+  flex: 1 1 auto;
+  min-width: 105px;
+}
+
+.semper-ocr-panel-header-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+
+.semper-ocr-update-reference-btn {
+  min-height: 30px !important;
+  padding: 5px 9px !important;
+  border-color: #4f9b32 !important;
+  background: #67c34a !important;
+  color: #fff !important;
+  font-size: 10px !important;
+  white-space: nowrap;
+}
+
+.semper-ocr-update-reference-btn:hover {
+  background: #56ae3a !important;
+}
+
+.semper-ocr-header-daily-counter {
+  padding: 2px 4px;
+  border: 1px solid #b9d8aa;
+  border-radius: 5px;
+  background: #f5fbf2;
+}
+
+.semper-ocr-header-daily-counter .semper-daily-category-counter {
+  color: #2e6620;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.semper-ocr-header-daily-counter .semper-daily-counter-btn,
+.semper-ocr-header-daily-counter .semper-daily-counter-reset {
+  min-width: 22px;
+  min-height: 24px;
+  padding: 2px 5px;
+  font-size: 10px;
+}
+
+#semper-ocr-panel.collapsed .semper-ocr-panel-header-actions > :not(.semper-ocr-collapse-btn) {
+  display: none !important;
+}
+
+/* v0.3.8 – mniejsze Sortowanie + edytowalne „Po zapisie” */
+.semper-sort-with-after-save {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.semper-sort-with-after-save > .semper-native-sort-input {
+  flex: 1 1 auto !important;
+  width: auto !important;
+  min-width: 80px !important;
+  max-width: none !important;
+  box-sizing: border-box;
+}
+
+.semper-after-save-sort-control {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  white-space: nowrap;
+  color: #536273;
+  font: 700 11px/1.2 Arial, Helvetica, sans-serif;
+}
+
+.semper-after-save-sort-input {
+  box-sizing: border-box;
+  width: 72px !important;
+  min-width: 72px !important;
+  height: 28px;
+  padding: 4px 6px !important;
+  border: 1px solid #aab6c4 !important;
+  border-radius: 4px !important;
+  background: #fff !important;
+  color: #172033 !important;
+  text-align: center;
+  font-weight: 700 !important;
+}
+
+/* v0.3.8 – bezpieczny układ nagłówka pełnego OCR */
+.semper-ocr-full-text-header {
+  display: grid !important;
+  grid-template-columns: minmax(90px, 1fr) auto minmax(90px, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.semper-ocr-rerun-inline {
+  justify-self: center;
+  min-height: 26px !important;
+  padding: 4px 9px !important;
+  font-size: 10px !important;
+  white-space: nowrap;
+}
+
+.semper-ocr-text-toggle {
+  justify-self: end;
+}
+
+/* v0.3.8 – wybór tytułu i daty obok siebie */
+.semper-ocr-actions-bottom {
+  display: block !important;
+  width: 100%;
+  margin-top: 9px;
+}
+
+.semper-ocr-selection-actions {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) !important;
+  gap: 7px;
+  width: 100%;
+}
+
+.semper-ocr-selection-actions .semper-ocr-btn {
+  width: 100%;
+  min-width: 0;
+  white-space: normal;
+}
+
+/* v0.3.8 – skuteczne usunięcie natywnej sekcji „Tekst” */
+.semper-original-text-editor-hidden {
+  display: none !important;
+}
+
+.semper-full-reference-preview-host {
+  width: 100%;
+  margin: 6px 0 0;
+}
+
+.semper-full-reference-preview-body {
+  overflow: visible;
+  background: #202020;
+}
+
+.semper-full-reference-preview-image {
+  display: block;
+  width: 100% !important;
+  max-width: none !important;
+  height: auto !important;
+  margin: 0 auto;
+  object-fit: contain;
+  background: #fff;
+}
+
+@media (max-width: 1250px) {
+  .semper-ocr-header-daily-counter {
+    display: none;
+  }
+}
+
+
+/* v0.3.9 – precyzyjnie kompaktowany natywny formularz ref_adm.php */
+#forma tr.semper-native-edit-row-hidden,
+#forma tr.semper-native-preview-row-hidden,
+#forma tr.semper-original-text-editor-hidden {
+  display: none !important;
+}
+
+/* Etykiety wskazane w HTML Wavepanelu mają być niewidoczne razem z ich wierszami. */
+#forma div.input_bgt_o.semper-hidden-native-label,
+#forma div.input_bgt.semper-hidden-native-label {
+  display: none !important;
+}
+
+/* Sortowanie + Po zapisie pozostają czytelne i dostępne. */
+.semper-sort-with-after-save > .semper-native-sort-input {
+  flex: 1 1 220px !important;
+  min-width: 120px !important;
+}
+
+.semper-after-save-sort-input {
+  width: 104px !important;
+  min-width: 104px !important;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Podgląd oryginału zastępuje miniaturę i CKEditor, bez czarnego marginesu wokół dokumentu. */
+.semper-full-reference-preview {
+  padding: 8px;
+  background: #f8fafc;
+}
+
+.semper-full-reference-preview-body {
+  width: 100%;
+  min-height: 160px;
+  overflow: auto;
+  background: #eef2f6 !important;
+  border: 1px solid #d9e0e8;
+  box-sizing: border-box;
+}
+
+.semper-full-reference-preview-image {
+  display: block;
+  width: 100% !important;
+  max-width: 100% !important;
+  height: auto !important;
+  margin: 0 auto;
+  object-fit: contain;
+  background: #fff;
+}
+
+
+/* v0.3.10 – precyzyjne ukrywanie tylko CKEditora i miniatury; pola formularza pozostają widoczne */
+#forma .semper-native-editor-widget-hidden,
+#forma .semper-native-mini-preview-content-hidden,
+#forma div.input_bgt_o.semper-hidden-native-label,
+#forma div.input_bgt.semper-hidden-native-label {
+  display: none !important;
+}
+
+/* Pola Aktywne / Sortowanie / Nazwa oraz natywne akcje muszą pozostać widoczne. */
+#forma select[name="params[act]"],
+#forma input[name="params[sort]"],
+#forma input[name="params[name]"],
+#forma #todo_add,
+#forma a.btn_normal3[title="Anuluj"] {
+  visibility: visible !important;
+  opacity: 1 !important;
+}
+
+/* RRMMDD mieści się w krótszym polu. */
+.semper-after-save-sort-input {
+  width: 82px !important;
+  min-width: 82px !important;
+}
+
+
+/* v0.3.11 – formularz kompaktowy: chowamy tylko Alias, Zdjęcie, miniaturę i Tekst. */
+#forma .semper-native-edit-row-hidden,
+#forma .semper-native-preview-row-hidden,
+#forma .semper-original-text-editor-hidden,
+#forma .semper-native-editor-widget-hidden,
+#forma .semper-native-mini-preview-content-hidden,
+#forma .semper-hidden-native-label {
+  display: none !important;
+}
+
+/* Wymagane pola i natywne akcje zawsze pozostają dostępne. */
+#forma select[name="params[act]"],
+#forma input[name="params[sort]"],
+#forma input[name="params[name]"],
+#forma #todo_add,
+#forma a.btn_normal3[title="Anuluj"] {
+  display: revert !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+}
+
+/* v0.3.12 – tylko zweryfikowane kontenery pól mogą zostać ukryte. */
+#forma .semper-ukryte-pole-natywne,
+#forma .semper-ukryty-element-natywny {
+  display: none !important;
+}
+
+/* Pełny plik referencji, bez ograniczania naturalnej szerokości obrazu. */
+#semper-original-preview-host > td.semper-original-preview-cell {
+  padding: 6px 0 0 !important;
+  background: transparent !important;
+}
+
+.semper-original-preview-host {
+  width: 100%;
+  margin: 6px 0 0;
+}
+
+#semper-original-preview-host.semper-original-preview-layout-cell {
+  width: 480px;
+  min-width: 360px;
+  padding: 0 8px;
+  vertical-align: top;
+}
+
+.semper-original-preview {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #c9d3df;
+  border-radius: 5px;
+  background: #f8fafc;
+  box-sizing: border-box;
+}
+
+.semper-original-preview header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 7px;
+  color: #10233f;
+  font: 700 12px/1.2 Arial, Helvetica, sans-serif;
+}
+
+.semper-original-preview-open {
+  color: #1d5d9f;
+  font-size: 11px;
+  text-decoration: underline;
+}
+
+.semper-original-preview img {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+  background: #fff;
+}
