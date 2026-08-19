@@ -400,6 +400,51 @@ body.semper-ocr-sidebar-active.semper-ocr-sidebar-resizing {
   vertical-align: top;
 }
 
+.semper-ref-opcje-naglowek,
+.semper-ref-opcje-komorka {
+  min-width: 190px !important;
+  width: 190px;
+  vertical-align: top;
+}
+
+.semper-ref-opcje-akcje {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+}
+
+.semper-ref-opcje-komorka > select[hidden] {
+  display: none !important;
+}
+
+.semper-ref-opcja-przycisk {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: #fff !important;
+  font: 700 11px/1.3 Arial, sans-serif;
+  text-align: center;
+  text-decoration: none !important;
+  cursor: pointer;
+  background-image: none !important;
+}
+
+.semper-ref-opcja-edytuj { background-color: #1d5d9f !important; border-color: #174c82; }
+.semper-ref-opcja-kategorie { background-color: #2f7d32 !important; border-color: #286b2b; }
+.semper-ref-opcja-usun {
+  grid-column: 1 / -1;
+  background-color: #b3261e !important;
+  border-color: #972019;
+}
+
+.semper-ref-opcja-edytuj:hover { background-color: #174c82 !important; }
+.semper-ref-opcja-kategorie:hover { background-color: #286b2b !important; }
+.semper-ref-opcja-usun:hover { background-color: #972019 !important; }
+
 .semper-ref-title-cell,
 .semper-ref-date-cell,
 .semper-ref-category-cell,
@@ -434,6 +479,16 @@ body.semper-ocr-sidebar-active.semper-ocr-sidebar-resizing {
 .semper-ref-status-bad { color: #a01737; font-weight: 700; }
 .semper-ref-status-wait { color: #536273; font-weight: 700; }
 .semper-ref-row-processing { outline: 2px solid rgba(29, 93, 159, .28); outline-offset: -2px; }
+
+.semper-ref-row-categorized > td {
+  background: #edf7e8 !important;
+}
+
+.semper-ref-row-categorized .semper-ref-pill {
+  border-color: #a9c99a;
+  background: #e4f2dd;
+  color: #356b27;
+}
 
 
 .semper-ocr-text[contenteditable="true"] {
@@ -1427,13 +1482,6 @@ tr.semper-original-text-editor-hidden {
   margin: 6px 0 0;
 }
 
-#semper-original-preview-host.semper-original-preview-layout-cell {
-  width: 480px;
-  min-width: 360px;
-  padding: 0 8px;
-  vertical-align: top;
-}
-
 .semper-original-preview {
   width: 100%;
   padding: 8px;
@@ -1461,8 +1509,8 @@ tr.semper-original-text-editor-hidden {
 
 .semper-original-preview img {
   display: block;
-  width: auto;
-  max-width: 100%;
+  width: 100%;
+  max-width: none;
   height: auto;
   margin: 0 auto;
   background: #fff;

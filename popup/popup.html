@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SEMPER – Referencje OCR</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <h1>SEMPER – Referencje OCR</h1>
+    <p id="stan" class="stan">Sprawdzanie stanu…</p>
+
+    <section>
+      <h2>Wyłącz czasowo</h2>
+      <div class="siatka">
+        <button type="button" data-minuty="15">15 minut</button>
+        <button type="button" data-minuty="60">1 godzina</button>
+        <button type="button" data-minuty="480">8 godzin</button>
+        <button type="button" data-minuty="1440">24 godziny</button>
+      </div>
+    </section>
+
+    <button id="wylacz-bezterminowo" type="button" class="drugorzedny">Wyłącz do ponownego włączenia</button>
+    <button id="wlacz" type="button" class="glowny">Włącz teraz</button>
+    <p class="informacja">Zmiana odświeży otwartą stronę panelu SEMPER.</p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

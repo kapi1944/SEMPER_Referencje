@@ -1,11 +1,15 @@
 {
   "manifest_version": 3,
   "name": "SEMPER – Referencje OCR",
-  "version": "0.3.16",
+  "version": "0.3.17",
   "description": "OCR referencji SEMPER z klasyfikatorem 3.2, RRMMDD i kompaktowym formularzem: Aktywne, Sortowanie, Po zapisie, Nazwa oraz pełnowymiarowy podgląd oryginału.",
   "permissions": [
     "storage"
   ],
+  "action": {
+    "default_title": "Włącz lub wstrzymaj SEMPER – Referencje OCR",
+    "default_popup": "popup/popup.html"
+  },
   "host_permissions": [
     "https://www.szkolenia-semper.pl/*"
   ],

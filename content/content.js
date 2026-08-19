@@ -2,7 +2,8 @@
   'use strict';
 
   const SOURCE = 'semper-referencje-ocr';
-  const EXTENSION_VERSION = '0.3.11';
+  const EXTENSION_VERSION = '0.3.17';
+  const KLUCZ_STANU_WTYCZKI = 'semper_stan_wtyczki_v1';
   const STORAGE_PREFIX = 'semper_ref_v2_';
   const CATEGORY_CACHE_PREFIX = 'semper_ref_cat_v3_';
   const CATEGORY_CACHE_TTL = 10 * 60 * 1000;
@@ -2092,57 +2093,60 @@
     return znajdzWierszDoWstawienia(document.getElementById('todo_add'));
   }
 
-  function znajdzKomorkiUkladuPodgladu() {
-    const komorkaMenu = document.querySelector('td#menu');
-    let komorkaFormularza = komorkaMenu?.nextElementSibling;
-    if (komorkaFormularza?.id === 'semper-original-preview-host') komorkaFormularza = komorkaFormularza.nextElementSibling;
-    if (!komorkaFormularza?.querySelector('#forma')) return null;
-    return { komorkaMenu, komorkaFormularza };
+  function znajdzMiejscePodgladuOryginalu() {
+    if (location.pathname.endsWith('/wavepanel/ref_adm.php')) {
+      const poleNazwy = document.querySelector('#forma input[name="params[name]"]');
+      const wierszNazwy = znajdzWierszDoWstawienia(poleNazwy);
+      if (wierszNazwy?.parentNode) return { kotwica: wierszNazwy, pozycja: 'after' };
+
+      const celAwaryjny = findCategoryInsertTarget();
+      if (celAwaryjny?.anchor?.parentNode) {
+        return {
+          kotwica: celAwaryjny.anchor,
+          pozycja: celAwaryjny.position === 'before' ? 'before' : 'after'
+        };
+      }
+    }
+
+    if (location.pathname.endsWith('/wavepanel/ref_kat.php')) {
+      const wyborKategorii = document.querySelector('select[name="params[lista][]"]');
+      const wierszKategorii = znajdzWierszDoWstawienia(wyborKategorii);
+      if (wierszKategorii?.parentNode) return { kotwica: wierszKategorii, pozycja: 'after' };
+    }
+
+    return null;
   }
 
   function utworzLubAktualizujPodgladOryginalu(adresObrazu) {
-    if (!location.pathname.endsWith('/wavepanel/ref_adm.php')) return false;
-    skompaktujNatywnyFormularzReferencji();
+    const stronaEdycji = location.pathname.endsWith('/wavepanel/ref_adm.php');
+    const stronaKategorii = location.pathname.endsWith('/wavepanel/ref_kat.php');
+    if (!stronaEdycji && !stronaKategorii) return false;
+    if (stronaEdycji) skompaktujNatywnyFormularzReferencji();
 
     let hostPodgladu = document.getElementById('semper-original-preview-host');
-    const komorkiUkladu = znajdzKomorkiUkladuPodgladu();
-    if (komorkiUkladu && (hostPodgladu?.tagName !== 'TD' || hostPodgladu.previousElementSibling !== komorkiUkladu.komorkaMenu)) {
-      // Usuwamy wyłącznie stary, należący do rozszerzenia host z wnętrza formularza.
-      hostPodgladu.remove();
-      hostPodgladu = null;
-    }
 
     if (!hostPodgladu) {
-      let kontenerSekcji;
-      if (komorkiUkladu) {
-        hostPodgladu = document.createElement('td');
-        hostPodgladu.id = 'semper-original-preview-host';
-        hostPodgladu.className = 'semper-original-preview-layout-cell';
-        komorkiUkladu.komorkaMenu.parentNode.insertBefore(hostPodgladu, komorkiUkladu.komorkaFormularza);
-        kontenerSekcji = hostPodgladu;
-      } else {
-        const celKategorii = findCategoryInsertTarget();
-        const kotwicaKategorii = celKategorii?.anchor?.parentNode ? celKategorii.anchor : null;
-        const kotwica = kotwicaKategorii || znajdzKotwicePodgladu();
-        if (!kotwica?.parentNode) return false;
+      const miejsce = znajdzMiejscePodgladuOryginalu();
+      const kotwica = miejsce?.kotwica || znajdzKotwicePodgladu();
+      if (!kotwica?.parentNode) return false;
 
-        const wiersz = kotwica.tagName === 'TR' ? kotwica : znajdzWierszDoWstawienia(kotwica);
-        hostPodgladu = document.createElement(wiersz ? 'tr' : 'div');
-        hostPodgladu.id = 'semper-original-preview-host';
-        kontenerSekcji = hostPodgladu;
-        if (wiersz) {
-          const komorka = document.createElement('td');
-          const liczbaKolumn = directCells(wiersz).reduce((suma, komorkaWiersza) => suma + Math.max(1, Number(komorkaWiersza.colSpan) || 1), 0);
-          komorka.colSpan = Math.max(2, liczbaKolumn || directCells(wiersz).length || 2);
-          komorka.className = 'semper-original-preview-cell';
-          hostPodgladu.appendChild(komorka);
-          kontenerSekcji = komorka;
-        } else {
-          hostPodgladu.className = 'semper-original-preview-host';
-        }
-        const kotwicaWstawienia = wiersz || kotwica;
-        kotwicaWstawienia.parentNode.insertBefore(hostPodgladu, kotwicaKategorii ? kotwicaWstawienia.nextSibling : kotwicaWstawienia);
+      const wiersz = kotwica.tagName === 'TR' ? kotwica : znajdzWierszDoWstawienia(kotwica);
+      hostPodgladu = document.createElement(wiersz ? 'tr' : 'div');
+      hostPodgladu.id = 'semper-original-preview-host';
+      let kontenerSekcji = hostPodgladu;
+      if (wiersz) {
+        const komorka = document.createElement('td');
+        const liczbaKolumn = directCells(wiersz).reduce((suma, komorkaWiersza) => suma + Math.max(1, Number(komorkaWiersza.colSpan) || 1), 0);
+        komorka.colSpan = Math.max(2, liczbaKolumn || directCells(wiersz).length || 2);
+        komorka.className = 'semper-original-preview-cell';
+        hostPodgladu.appendChild(komorka);
+        kontenerSekcji = komorka;
+      } else {
+        hostPodgladu.className = 'semper-original-preview-host';
       }
+      const kotwicaWstawienia = wiersz || kotwica;
+      const wstawPoKotwicy = miejsce?.pozycja !== 'before';
+      kotwicaWstawienia.parentNode.insertBefore(hostPodgladu, wstawPoKotwicy ? kotwicaWstawienia.nextSibling : kotwicaWstawienia);
 
       const sekcja = document.createElement('section');
       sekcja.className = 'semper-original-preview';
@@ -2328,7 +2332,7 @@
         status.textContent = 'Niezapisane zmiany';
       } else {
         const selectedCount = optionSnapshot.filter((option) => option.selected).length;
-        status.className = 'semper-inline-category-status';
+        status.className = `semper-inline-category-status${selectedCount ? ' success' : ''}`;
         status.textContent = selectedCount ? `Zapisane: ${selectedCount}` : 'Brak zapisanych kategorii';
       }
       return dirty;
@@ -2354,6 +2358,7 @@
         record = await getRecord(id);
         updateInlineCategorySuggestions(section, record);
         const selectedCount = optionSnapshot.filter((option) => option.selected).length;
+        status.className = `semper-inline-category-status${selectedCount ? ' success' : ''}`;
         status.textContent = selectedCount ? `Zapisane: ${selectedCount}` : 'Brak zapisanych kategorii';
         setDirty(categoryDirtyKey, false);
         if (force) await chrome.storage.local.remove(categoryCacheKey(id));
@@ -2437,7 +2442,7 @@
         input.checked = savedIds.has(String(input.value));
       });
       const selectedCount = optionSnapshot.filter((option) => option.selected).length;
-      status.className = 'semper-inline-category-status success';
+      status.className = `semper-inline-category-status${selectedCount ? ' success' : ''}`;
       status.textContent = selectedCount ? `Zapisane: ${selectedCount}` : 'Brak zapisanych kategorii';
       setDirty(categoryDirtyKey, false);
     });
@@ -2595,6 +2600,89 @@
 
   function insertAfter(referenceNode, newNode) {
     referenceNode.parentNode.insertBefore(newNode, referenceNode.nextSibling);
+  }
+
+  function opisKontrolkiOpcji(kontrolka) {
+    const atrybuty = ['href', 'onclick', 'title', 'aria-label', 'value', 'src', 'alt'];
+    const elementy = [kontrolka, ...kontrolka.querySelectorAll('*')];
+    return elementy
+      .flatMap((element) => atrybuty.map((atrybut) => element.getAttribute?.(atrybut) || ''))
+      .concat(kontrolka.textContent || '')
+      .join(' ')
+      .toLowerCase();
+  }
+
+  function typKontrolkiOpcji(kontrolka) {
+    const opis = opisKontrolkiOpcji(kontrolka);
+    if (/usuń|usun|kasuj|delete|remove|\bdel\b|[?&]opc=(?:del|delete|remove)\b/.test(opis)) return 'usun';
+    if (/ref_kat\.php|kategor/.test(opis)) return 'kategorie';
+    if (/ref_adm\.php|edyt|edit/.test(opis)) return 'edytuj';
+    return '';
+  }
+
+  function ustawEtykieteKontrolkiOpcji(kontrolka, etykieta) {
+    if (kontrolka.matches('input')) kontrolka.value = etykieta;
+    else kontrolka.textContent = etykieta;
+  }
+
+  function utworzPrzyciskZOpcjiListy(lista, opcja) {
+    const przycisk = document.createElement('button');
+    przycisk.type = 'button';
+    przycisk.addEventListener('click', () => {
+      lista.value = opcja.value;
+      lista.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    return przycisk;
+  }
+
+  function przywrocPrzyciskiOpcji(komorka) {
+    if (!komorka || komorka.dataset.semperOpcje === '1') return false;
+    const kontrolki = [...komorka.querySelectorAll('a, button, input[type="button"], input[type="submit"]')]
+      .filter((kontrolka) => !kontrolka.parentElement?.closest('a, button'));
+    const wedlugTypu = new Map();
+    for (const kontrolka of kontrolki) {
+      const typ = typKontrolkiOpcji(kontrolka);
+      if (typ && !wedlugTypu.has(typ)) wedlugTypu.set(typ, kontrolka);
+    }
+
+    const listyOpcji = [...komorka.querySelectorAll('select')];
+    for (const lista of listyOpcji) {
+      for (const opcja of lista.options) {
+        const typ = typKontrolkiOpcji(opcja);
+        if (typ && !wedlugTypu.has(typ)) {
+          wedlugTypu.set(typ, utworzPrzyciskZOpcjiListy(lista, opcja));
+        }
+      }
+    }
+    if (!wedlugTypu.has('edytuj') || !wedlugTypu.has('kategorie') || !wedlugTypu.has('usun')) return false;
+
+    const kontener = document.createElement('div');
+    kontener.className = 'semper-ref-opcje-akcje';
+    const ustawienia = [
+      ['edytuj', '✏️ Edytuj'],
+      ['kategorie', '📚 Kategorie'],
+      ['usun', '❌ Usuń']
+    ];
+    for (const [typ, etykieta] of ustawienia) {
+      const kontrolka = wedlugTypu.get(typ);
+      kontrolka.classList.add('semper-ref-opcja-przycisk', `semper-ref-opcja-${typ}`);
+      ustawEtykieteKontrolkiOpcji(kontrolka, etykieta);
+      kontener.appendChild(kontrolka);
+    }
+    komorka.textContent = '';
+    komorka.classList.add('semper-ref-opcje-komorka');
+    komorka.dataset.semperOpcje = '1';
+    for (const lista of listyOpcji) {
+      lista.hidden = true;
+      komorka.appendChild(lista);
+    }
+    komorka.appendChild(kontener);
+    return true;
+  }
+
+  function ustawKolorPrzypisanejReferencji(zadanie) {
+    const maKategorie = Boolean(zadanie?.assigned?.ids?.length);
+    zadanie?.row?.classList.toggle('semper-ref-row-categorized', maKategorie);
   }
 
   async function processWithLimit(items, limit, handler) {
@@ -2906,6 +2994,7 @@
           try {
             job.assigned = await getAssignedCategories(job.id, true);
             renderPills(job.categoryCell, job.assigned.names, 'Nieprzypisane');
+            ustawKolorPrzypisanejReferencji(job);
           } catch (error) {
             job.categoryCell.textContent = 'Błąd odczytu';
             job.categoryCell.title = String(error?.message || error);
@@ -2996,9 +3085,12 @@
 
     const headerCells = directCells(header);
     const nameHeader = headerCells.find((c) => ['nazwa:', 'nazwa'].includes(c.textContent.trim().toLowerCase()));
+    const naglowekOpcji = headerCells.find((c) => normalizeUiText(c.textContent).includes('opcje'));
     if (!nameHeader) return false;
     const nameVisualIndex = getVisualColumnStart(header, nameHeader);
+    const indeksOpcji = getVisualColumnStart(header, naglowekOpcji);
     if (nameVisualIndex < 0) return false;
+    if (naglowekOpcji) naglowekOpcji.classList.add('semper-ref-opcje-naglowek');
 
     const titleHeader = document.createElement('th');
     titleHeader.className = 'semper-ref-title-header';
@@ -3026,7 +3118,9 @@
     for (const row of rows) {
       const id = getIdFromRow(row);
       const nameCell = findCellAtVisualColumn(row, nameVisualIndex);
+      const komorkaOpcji = findCellAtVisualColumn(row, indeksOpcji);
       if (!nameCell) continue;
+      przywrocPrzyciskiOpcji(komorkaOpcji);
 
       const titleCell = document.createElement('td');
       titleCell.className = 'semper-ref-title-cell';
@@ -3069,6 +3163,7 @@
       try {
         job.assigned = await getAssignedCategories(job.id);
         renderPills(job.categoryCell, job.assigned.names, 'Nieprzypisane');
+        ustawKolorPrzypisanejReferencji(job);
       } catch (error) {
         job.assigned = { ids: [], names: [] };
         job.categoryCell.textContent = 'Błąd odczytu';
@@ -3934,13 +4029,16 @@
     if (!id) return;
     let record = await getRecord(id);
     if (record) record = await ensureRecordClassification(id, record);
+    let imageUrl = record?.imageUrl || await fetchImageUrlForReference(id);
+    utworzLubAktualizujPodgladOryginalu(imageUrl);
     if (!record?.ocrText) {
-      const imageUrl = await fetchImageUrlForReference(id);
       if (imageUrl) {
         try { record = await analyzeReference(id, imageUrl); } catch (error) { console.warn('[SEMPER OCR]', error); }
       }
     }
-    await buildAnalysisPanel(id, record?.imageUrl || await fetchImageUrlForReference(id), record);
+    imageUrl = record?.imageUrl || imageUrl;
+    utworzLubAktualizujPodgladOryginalu(imageUrl);
+    await buildAnalysisPanel(id, imageUrl, record);
 
     const panel = document.getElementById('semper-ocr-panel');
     const select = document.querySelector('select[name="params[lista][]"]');
@@ -4003,6 +4101,16 @@
 
   async function boot() {
     try {
+      const stanWtyczki = (await chrome.storage.local.get(KLUCZ_STANU_WTYCZKI))[KLUCZ_STANU_WTYCZKI];
+      const wylaczenieBezterminowe = stanWtyczki?.tryb === 'bezterminowo';
+      const wylaczenieCzasowe = stanWtyczki?.tryb === 'czasowo'
+        && Number(stanWtyczki.wylaczoneDo) > Date.now();
+      if (wylaczenieCzasowe) {
+        const opoznienie = Math.min(Number(stanWtyczki.wylaczoneDo) - Date.now() + 250, 2147483647);
+        setTimeout(() => location.reload(), opoznienie);
+      }
+      if (wylaczenieBezterminowe || wylaczenieCzasowe) return;
+
       await processPendingCategorySaveCounter();
       if (location.pathname.endsWith('/wavepanel/ref.php')) {
         if (await continuePendingListPageJump()) return;
@@ -4022,6 +4130,10 @@
       console.error('[SEMPER OCR] Błąd uruchomienia', error);
     }
   }
+
+  chrome.storage.onChanged.addListener((zmiany, obszar) => {
+    if (obszar === 'local' && zmiany[KLUCZ_STANU_WTYCZKI]) location.reload();
+  });
 
   boot();
 })();
