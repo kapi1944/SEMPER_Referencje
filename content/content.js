@@ -2569,6 +2569,67 @@
     return [...row.children].filter((c) => /^(TD|TH)$/.test(c.tagName));
   }
 
+  function wlaczZmianeSzerokosciKolumn(tabela, wierszNaglowka) {
+    const komorkiNaglowka = directCells(wierszNaglowka);
+    if (komorkiNaglowka.length < 2 || tabela.dataset.semperZmianaSzerokosci === '1') return;
+    tabela.dataset.semperZmianaSzerokosci = '1';
+
+    for (let indeks = 0; indeks < komorkiNaglowka.length - 1; indeks += 1) {
+      const komorka = komorkiNaglowka[indeks];
+      const nastepnaKomorka = komorkiNaglowka[indeks + 1];
+      const uchwyt = document.createElement('span');
+      uchwyt.className = 'semper-ref-column-resizer';
+      uchwyt.title = 'Przeciągnij, aby zmienić szerokość kolumny';
+      uchwyt.setAttribute('aria-hidden', 'true');
+      komorka.classList.add('semper-ref-resizable-header');
+
+      uchwyt.addEventListener('pointerdown', (event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        event.stopPropagation();
+
+        const szerokoscTabeli = tabela.getBoundingClientRect().width;
+        const szerokosci = komorkiNaglowka.map((naglowek) => naglowek.getBoundingClientRect().width);
+        if (!szerokoscTabeli || !szerokosci[indeks] || !szerokosci[indeks + 1]) return;
+
+        for (let numer = 0; numer < komorkiNaglowka.length; numer += 1) {
+          komorkiNaglowka[numer].style.setProperty('width', `${(szerokosci[numer] / szerokoscTabeli) * 100}%`, 'important');
+        }
+
+        const poczatekX = event.clientX;
+        const szerokoscBiezaca = szerokosci[indeks];
+        const szerokoscNastepna = szerokosci[indeks + 1];
+        const minimalnaSzerokosc = 48;
+        uchwyt.setPointerCapture(event.pointerId);
+        uchwyt.classList.add('aktywny');
+        document.body.classList.add('semper-ref-column-resizing');
+
+        const przesun = (zdarzenie) => {
+          const przesuniecie = Math.max(
+            minimalnaSzerokosc - szerokoscBiezaca,
+            Math.min(zdarzenie.clientX - poczatekX, szerokoscNastepna - minimalnaSzerokosc)
+          );
+          komorka.style.setProperty('width', `${((szerokoscBiezaca + przesuniecie) / szerokoscTabeli) * 100}%`, 'important');
+          nastepnaKomorka.style.setProperty('width', `${((szerokoscNastepna - przesuniecie) / szerokoscTabeli) * 100}%`, 'important');
+        };
+
+        const zakoncz = () => {
+          uchwyt.removeEventListener('pointermove', przesun);
+          uchwyt.removeEventListener('pointerup', zakoncz);
+          uchwyt.removeEventListener('pointercancel', zakoncz);
+          uchwyt.classList.remove('aktywny');
+          document.body.classList.remove('semper-ref-column-resizing');
+        };
+
+        uchwyt.addEventListener('pointermove', przesun);
+        uchwyt.addEventListener('pointerup', zakoncz);
+        uchwyt.addEventListener('pointercancel', zakoncz);
+      });
+
+      komorka.appendChild(uchwyt);
+    }
+  }
+
   function getVisualColumnStart(row, targetCell) {
     let visualIndex = 0;
     for (const cell of directCells(row)) {
@@ -2660,8 +2721,8 @@
     kontener.className = 'semper-ref-opcje-akcje';
     const ustawienia = [
       ['edytuj', '✏️ Edytuj'],
-      ['kategorie', '📚 Kategorie'],
-      ['usun', '❌ Usuń']
+      ['usun', '❌ Usuń'],
+      ['kategorie', '📚 Kategorie']
     ];
     for (const [typ, etykieta] of ustawienia) {
       const kontrolka = wedlugTypu.get(typ);
@@ -2678,6 +2739,20 @@
     }
     komorka.appendChild(kontener);
     return true;
+  }
+
+  function przywrocPrzyciskiOpcjiWWierszu(wiersz, indeksPoczatkowy, liczbaKolumn) {
+    const kandydaci = [];
+    for (let przesuniecie = liczbaKolumn - 1; przesuniecie >= 0; przesuniecie -= 1) {
+      const komorka = findCellAtVisualColumn(wiersz, indeksPoczatkowy + przesuniecie);
+      if (komorka && !kandydaci.includes(komorka)) kandydaci.push(komorka);
+    }
+    for (const komorka of directCells(wiersz)) {
+      if (normalizeUiText(komorka.textContent).includes('opcje') && !kandydaci.includes(komorka)) {
+        kandydaci.push(komorka);
+      }
+    }
+    return kandydaci.some(przywrocPrzyciskiOpcji);
   }
 
   function ustawKolorPrzypisanejReferencji(zadanie) {
@@ -2889,6 +2964,11 @@
     refresh.type = 'button';
     refresh.textContent = 'Odśwież dane';
 
+    const otworzNieprzypisane = document.createElement('button');
+    otworzNieprzypisane.type = 'button';
+    otworzNieprzypisane.textContent = 'Otwórz nieprzypisane';
+    otworzNieprzypisane.title = 'Otwiera strony kategorii wszystkich wczytanych referencji bez przypisanej kategorii.';
+
     const filter = document.createElement('select');
     filter.innerHTML = '<option value="all">Wszystkie</option><option value="unanalyzed">Nieanalizowane</option><option value="verify">Do weryfikacji</option><option value="conflict">Rozbieżność kategorii</option><option value="nocat">Bez kategorii</option>';
 
@@ -2980,6 +3060,21 @@
       status.textContent = `Widoczne po filtrze: ${visible} / ${jobs.length}`;
     });
 
+    otworzNieprzypisane.addEventListener('click', () => {
+      const oczekujace = jobs.filter((zadanie) => !zadanie.assigned).length;
+      const nieprzypisane = jobs.filter((zadanie) => zadanie.assigned && !zadanie.assigned.ids?.length);
+      if (!nieprzypisane.length) {
+        status.textContent = oczekujace
+          ? `Kategorie są jeszcze wczytywane (${oczekujace}). Spróbuj ponownie za chwilę.`
+          : 'Brak nieprzypisanych referencji na tej stronie.';
+        return;
+      }
+      for (const zadanie of nieprzypisane) {
+        window.open(`https://www.szkolenia-semper.pl/wavepanel/ref_kat.php?id=${encodeURIComponent(zadanie.id)}`, '_blank', 'noopener');
+      }
+      status.textContent = `Otwarto nieprzypisane referencje: ${nieprzypisane.length}.`;
+    });
+
     refresh.addEventListener('click', async () => {
       refresh.disabled = true;
       status.textContent = 'Odświeżam tytuły i zapisane kategorie...';
@@ -3057,7 +3152,7 @@
       jumpButton.disabled = false;
     });
 
-    toolbar.append(analyze, refresh, filter, dailyCounter, status);
+    toolbar.append(analyze, refresh, otworzNieprzypisane, filter, dailyCounter, status);
     table.parentNode.insertBefore(toolbar, table);
 
     const bottomControls = document.createElement('div');
@@ -3078,6 +3173,7 @@
   async function enhanceReferenceList() {
     const table = findReferenceTable();
     if (!table || table.dataset.semperOcrV2 === '1') return false;
+    table.classList.add('semper-ref-table');
     const listMeta = await expandReferenceTableForPreferredSize(table);
     table.dataset.semperOcrV2 = '1';
     const header = findHeaderRow(table);
@@ -3085,12 +3181,28 @@
 
     const headerCells = directCells(header);
     const nameHeader = headerCells.find((c) => ['nazwa:', 'nazwa'].includes(c.textContent.trim().toLowerCase()));
+    const naglowekSortowania = headerCells.find((c) => normalizeUiText(c.textContent).startsWith('sortowanie'));
     const naglowekOpcji = headerCells.find((c) => normalizeUiText(c.textContent).includes('opcje'));
     if (!nameHeader) return false;
     const nameVisualIndex = getVisualColumnStart(header, nameHeader);
+    const indeksSortowania = getVisualColumnStart(header, naglowekSortowania);
     const indeksOpcji = getVisualColumnStart(header, naglowekOpcji);
+    const liczbaKolumnOpcji = Math.max(1, Number(naglowekOpcji?.colSpan) || 1);
     if (nameVisualIndex < 0) return false;
-    if (naglowekOpcji) naglowekOpcji.classList.add('semper-ref-opcje-naglowek');
+    nameHeader.classList.add('semper-ref-name-header');
+    if (naglowekSortowania) naglowekSortowania.classList.add('semper-ref-sort-header');
+    if (naglowekOpcji) {
+      naglowekOpcji.colSpan = 1;
+      naglowekOpcji.textContent = 'Flagi';
+      naglowekOpcji.classList.add('semper-ref-flagi-naglowek');
+      if (liczbaKolumnOpcji > 1) {
+        const naglowekAkcji = document.createElement(naglowekOpcji.tagName.toLowerCase());
+        naglowekAkcji.className = 'semper-ref-opcje-naglowek';
+        naglowekAkcji.colSpan = liczbaKolumnOpcji - 1;
+        naglowekAkcji.textContent = 'Akcje';
+        insertAfter(naglowekOpcji, naglowekAkcji);
+      }
+    }
 
     const titleHeader = document.createElement('th');
     titleHeader.className = 'semper-ref-title-header';
@@ -3118,9 +3230,11 @@
     for (const row of rows) {
       const id = getIdFromRow(row);
       const nameCell = findCellAtVisualColumn(row, nameVisualIndex);
-      const komorkaOpcji = findCellAtVisualColumn(row, indeksOpcji);
       if (!nameCell) continue;
-      przywrocPrzyciskiOpcji(komorkaOpcji);
+      findCellAtVisualColumn(row, indeksOpcji)?.classList.add('semper-ref-flagi-komorka');
+      findCellAtVisualColumn(row, indeksSortowania)?.classList.add('semper-ref-sort-cell');
+      nameCell.classList.add('semper-ref-name-cell');
+      przywrocPrzyciskiOpcjiWWierszu(row, indeksOpcji, liczbaKolumnOpcji);
 
       const titleCell = document.createElement('td');
       titleCell.className = 'semper-ref-title-cell';
@@ -3146,6 +3260,8 @@
       const editUrl = findReferenceEditUrlInRow(row, id);
       jobs.push({ id, row, editUrl, titleCell, issueDateCell, categoryCell, suggestionCell, ocrCell, record: null, assigned: null });
     }
+
+    wlaczZmianeSzerokosciKolumn(table, header);
 
     createToolbar(table, jobs, listMeta);
 
@@ -3207,8 +3323,6 @@
   function renderClassification(container, classification, options = {}) {
     const selectedIds = options.selectedIds instanceof Set ? options.selectedIds : new Set();
     const onSelectionChange = typeof options.onSelectionChange === 'function' ? options.onSelectionChange : null;
-    const onSaveCategories = typeof options.onSaveCategories === 'function' ? options.onSaveCategories : null;
-    const saving = Boolean(options.saving);
 
     container.textContent = '';
     const label = document.createElement('div');
@@ -3293,20 +3407,6 @@
       ? `Pewność: ${classification.level}. Status: ${classification.status}. Zaznaczenia możesz zmienić niezależnie od wyniku procentowego.`
       : `Najlepszy kandydat: ${topScore}/100. Status: Wymaga ręcznej weryfikacji (próg kategorii głównej: 70). Możesz zaznaczyć słabszych kandydatów ręcznie.`;
     container.appendChild(meta);
-
-    if (onSaveCategories) {
-      const categoryActions = document.createElement('div');
-      categoryActions.className = 'semper-ocr-class-actions';
-      const saveCategories = makeButton('Zapisz zaznaczone kategorie');
-      saveCategories.classList.add('primary');
-      saveCategories.disabled = saving;
-      saveCategories.addEventListener('click', () => onSaveCategories(new Set(selectedIds), saveCategories));
-      const selectedCount = document.createElement('span');
-      selectedCount.className = 'semper-ocr-class-selected-count';
-      selectedCount.textContent = `Wybrane: ${selectedIds.size}`;
-      categoryActions.append(saveCategories, selectedCount);
-      container.appendChild(categoryActions);
-    }
 
     const knowledge = classification?.knowledge || knowledgeSummary();
     const sourceMeta = document.createElement('div');
@@ -3463,11 +3563,14 @@
     const titleInput = document.createElement('textarea');
     titleInput.className = 'semper-ocr-title-input';
     titleInput.placeholder = 'Wykryty lub ręcznie poprawiony tytuł szkolenia';
+    const edytorTytulu = document.createElement('div');
+    edytorTytulu.className = 'semper-ocr-edytor-tytulu';
     const titleSaveRow = document.createElement('div');
     titleSaveRow.className = 'semper-ocr-field-save-row';
     const save = makeButton('Zapisz tytuł', true);
     save.classList.add('semper-ocr-save-title-btn');
     titleSaveRow.appendChild(save);
+    edytorTytulu.append(titleInput, titleSaveRow);
 
     const issueDateLabel = document.createElement('div');
     issueDateLabel.className = 'semper-ocr-label semper-ocr-date-label';
@@ -3500,6 +3603,8 @@
 
     const classificationBox = document.createElement('div');
     classificationBox.className = 'semper-ocr-classification';
+    const przyciskZapiszIZastosujKategorie = makeButton('Zapisz i zastosuj kategorie [Wybrano: 0]', true);
+    przyciskZapiszIZastosujKategorie.classList.add('semper-ocr-zapisz-zastosuj-kategorie');
 
     const ocrLabel = document.createElement('div');
     ocrLabel.className = 'semper-ocr-label';
@@ -3535,8 +3640,8 @@
     selectionActions.append(useSelection, useDateSelection);
     actions.append(selectionActions);
 
-    panelBody.append(titleLabel, titleInput, titleSaveRow, issueDateLabel, issueDateRow, issueDateHint, status, classificationBox, ocrSection, actions);
-    panel.append(resizeHandle, panelHeader, panelBody);
+    panelBody.append(titleLabel, edytorTytulu, issueDateLabel, issueDateRow, issueDateHint, status, classificationBox, przyciskZapiszIZastosujKategorie, ocrSection);
+    panel.append(resizeHandle, panelHeader, panelBody, actions);
 
     const basePaddingRight = Math.max(0, Number.parseFloat(getComputedStyle(document.body).paddingRight) || 0);
     document.body.style.setProperty('--semper-ocr-base-padding-right', `${basePaddingRight}px`);
@@ -3620,6 +3725,7 @@
     let panelSavedCategoryIds = new Set();
     let panelCategorySelectionTouched = false;
     let panelCategorySaving = false;
+    let czyKategoriePaneluZatwierdzone = false;
 
     function sameIdSets(a, b) {
       if (a.size !== b.size) return false;
@@ -3627,7 +3733,9 @@
     }
 
     function updatePanelCategoryDirtyState() {
-      setDirty(panelCategoriesDirtyKey, !sameIdSets(panelSelectedCategoryIds, panelSavedCategoryIds));
+      const czyWyborBezZmian = sameIdSets(panelSelectedCategoryIds, panelSavedCategoryIds);
+      setDirty(panelCategoriesDirtyKey, !czyWyborBezZmian);
+      classificationBox.classList.toggle('manual-approved', czyKategoriePaneluZatwierdzone && czyWyborBezZmian);
     }
 
     function initializeSuggestedSelection(classification) {
@@ -3652,6 +3760,7 @@
         panelSelectedCategoryIds = new Set((verified.ids || []).map(String));
         panelSavedCategoryIds = new Set(panelSelectedCategoryIds);
         panelCategorySelectionTouched = false;
+        czyKategoriePaneluZatwierdzone = true;
         updatePanelCategoryDirtyState();
         if (verified.ids.length) await markCategoryAssignmentToday(id);
         window.dispatchEvent(new CustomEvent('semper-categories-saved', {
@@ -3687,7 +3796,6 @@
         status.textContent = verified.names.length
           ? `Zapisano kategorie: ${verified.names.join(', ')}.`
           : 'Zapisano brak kategorii.';
-        renderPanelClassification(record.classification || classify(titleInput.value, getEditableOcrText(ocrText)));
         announceRecordUpdate(id, record);
       } catch (error) {
         status.className = 'semper-ocr-error';
@@ -3695,24 +3803,36 @@
       } finally {
         panelCategorySaving = false;
         if (button) button.disabled = false;
+        renderPanelClassification(record.classification || classify(titleInput.value, getEditableOcrText(ocrText)));
       }
     }
 
     function renderPanelClassification(classification) {
       initializeSuggestedSelection(classification);
+      przyciskZapiszIZastosujKategorie.textContent = `Zapisz i zastosuj kategorie [Wybrano: ${panelSelectedCategoryIds.size}]`;
+      przyciskZapiszIZastosujKategorie.disabled = panelCategorySaving || !id;
       renderClassification(classificationBox, classification, {
         selectedIds: panelSelectedCategoryIds,
-        saving: panelCategorySaving,
         onSelectionChange: (selected) => {
           panelSelectedCategoryIds = selected;
           panelCategorySelectionTouched = true;
           updatePanelCategoryDirtyState();
-          const count = classificationBox.querySelector('.semper-ocr-class-selected-count');
-          if (count) count.textContent = `Wybrane: ${panelSelectedCategoryIds.size}`;
-        },
-        onSaveCategories: savePanelCategories
+          przyciskZapiszIZastosujKategorie.textContent = `Zapisz i zastosuj kategorie [Wybrano: ${panelSelectedCategoryIds.size}]`;
+        }
       });
     }
+
+    przyciskZapiszIZastosujKategorie.addEventListener('click', async () => {
+      const listaKategorii = document.querySelector('select[name="params[lista][]"]');
+      if (listaKategorii) {
+        for (const opcja of listaKategorii.options) {
+          opcja.selected = panelSelectedCategoryIds.has(String(opcja.value));
+        }
+        listaKategorii.dispatchEvent(new Event('change', { bubbles: true }));
+        if (id) await chrome.storage.local.remove(categoryCacheKey(id));
+      }
+      await savePanelCategories(new Set(panelSelectedCategoryIds), przyciskZapiszIZastosujKategorie);
+    });
 
     function updateTitleApprovalStyle() {
       const current = cleanTitle(titleInput.value);
@@ -3983,6 +4103,7 @@
         const assigned = await getAssignedCategories(id);
         panelSavedCategoryIds = new Set((assigned?.ids || []).map(String));
         panelSelectedCategoryIds = new Set(panelSavedCategoryIds);
+        czyKategoriePaneluZatwierdzone = panelSavedCategoryIds.size > 0;
         updatePanelCategoryDirtyState();
       } catch (error) {
         console.warn('[SEMPER OCR] Nie udało się wczytać zapisanych kategorii do panelu OCR.', error);
@@ -3993,6 +4114,7 @@
         panelSavedCategoryIds = new Set((event.detail?.ids || []).map(String));
         panelSelectedCategoryIds = new Set(panelSavedCategoryIds);
         panelCategorySelectionTouched = false;
+        czyKategoriePaneluZatwierdzone = true;
         updatePanelCategoryDirtyState();
         const currentClassification = record?.classification || classify(titleInput.value, getEditableOcrText(ocrText));
         renderPanelClassification(currentClassification);
@@ -4085,18 +4207,6 @@
       }));
     }, { capture: true });
 
-    if (!record?.classification?.best) return;
-
-    const apply = makeButton('Zastosuj sugerowane kategorie', true);
-    apply.addEventListener('click', async () => {
-      const ids = new Set([record.classification.best, ...(record.classification.additional || [])].filter(Boolean).map((c) => String(c.id)));
-      for (const option of select.options) option.selected = ids.has(String(option.value));
-      select.dispatchEvent(new Event('change', { bubbles: true }));
-      await chrome.storage.local.remove(categoryCacheKey(id));
-      const status = panel.querySelector('.semper-ocr-status');
-      if (status) status.textContent = `Zaznaczono: ${[...ids].join(', ')}. Zapis formularza pozostaje po stronie użytkownika.`;
-    });
-    panel.querySelector('.semper-ocr-actions')?.prepend(apply);
   }
 
   async function boot() {
