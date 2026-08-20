@@ -485,6 +485,35 @@ body.semper-ocr-sidebar-active.semper-ocr-sidebar-resizing {
   font-weight: 400;
 }
 
+.semper-ref-approval-badge {
+  display: table;
+  margin-top: 5px;
+  padding: 2px 5px;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: 10px !important;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap !important;
+}
+
+.semper-ref-date-cell .semper-ref-approval-badge {
+  margin-right: auto;
+  margin-left: auto;
+}
+
+.semper-ref-approval-badge.zatwierdzone {
+  border-color: #70a681;
+  background: #dff0e5;
+  color: #155c35;
+}
+
+.semper-ref-approval-badge.oczekujace {
+  border-color: #d3a64c;
+  background: #fff4d6;
+  color: #7a5200;
+}
+
 .semper-ref-table .semper-ref-ocr-header,
 .semper-ref-table .semper-ref-ocr-cell {
   width: 9% !important;

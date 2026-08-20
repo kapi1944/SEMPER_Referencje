@@ -23,7 +23,7 @@
 
   // Klasyfikator 3.0: hybrydowy model lokalny oparty na podobieństwie tytułów,
   // rdzeniach/fuzzy matching, publicznej ofercie SEMPER i zatwierdzonych decyzjach użytkownika.
-  const CLASSIFIER_VERSION = '3.2.0';
+  const CLASSIFIER_VERSION = '3.2.2';
   const KNOWLEDGE_CACHE_KEY = 'semper_classifier_knowledge_v3';
   const KNOWLEDGE_CACHE_TTL = 30 * 24 * 60 * 60 * 1000;
   const KNOWLEDGE_DISCOVERY_TTL = 7 * 24 * 60 * 60 * 1000;
@@ -223,7 +223,7 @@
 
   const CATEGORIES = [
     { id: 1, name: 'zamówienia publiczne', specificity: 1.08, anchors: ['zamówienia publiczne', 'prawo zamówień publicznych', 'pzp', 'swz', 'kio', 'przetarg', 'zamawiający', 'wykonawca', 'tryb podstawowy', 'postępowanie o udzielenie zamówienia'] },
-    { id: 2, name: 'zarządzanie / menedżerskie', anchors: ['zarządzanie zespołem', 'menedżer', 'kierownik', 'lider', 'leadership', 'przywództwo', 'motywowanie', 'delegowanie', 'zarządzanie procesami'] },
+    { id: 2, name: 'zarządzanie / menedżerskie', anchors: ['zarządzanie zespołem', 'zarządzanie zasobami ludzkimi', 'menedżer', 'kierownik', 'lider', 'leadership', 'przywództwo', 'motywowanie', 'delegowanie', 'zarządzanie procesami'] },
     { id: 3, name: 'zarządzanie projektami', specificity: 1.04, anchors: ['zarządzanie projektami', 'zarządzanie projektem', 'project management', 'project manager', 'agile', 'scrum', 'harmonogram projektu', 'metodyka projektowa'] },
     { id: 4, name: 'produkcja / logistyka', anchors: ['produkcja', 'logistyka', 'łańcuch dostaw', 'supply chain', 'lean', 'transport', 'incoterms', 'proces produkcyjny'] },
     { id: 5, name: 'negocjacje / sprzedaż / komunikacja', anchors: ['negocjacje', 'sprzedaż', 'komunikacja', 'perswazja', 'rozmowa handlowa', 'trudny klient', 'handlowiec', 'komunikacja w zespole'] },
@@ -296,6 +296,7 @@
 
   const STRONG_MARKERS = new Map([
     [1, ['pzp', 'swz', 'kio', 'zamowienia publiczne']],
+    [2, ['zarzadzanie zasobami ludzkimi']],
     [11, ['fidic', 'prawo budowlane', 'roboty budowlane']],
     [12, ['ksef', 'vat', 'cit', 'pit']],
     [13, ['fundusze europejskie', 'projekty unijne', 'kwalifikowalnosc wydatkow']],
@@ -331,6 +332,7 @@
       .toLowerCase()
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
+      .replace(/ł/g, 'l')
       .replace(/[„”"'’`]/g, ' ')
       .replace(/[^a-z0-9]+/g, ' ')
       .replace(/\s+/g, ' ')
@@ -756,7 +758,11 @@
     const markerHits = [];
     for (const marker of STRONG_MARKERS.get(category.id) || []) {
       const markerNorm = normalize(marker);
-      if (titleNorm.includes(markerNorm) || contextNorm.includes(markerNorm)) markerHits.push(marker);
+      const tokenyMarkera = classifierTokens(marker);
+      const dopasowanieOdmiany = tokenyMarkera.length >= 2 && tokenyMarkera.every((tokenMarkera) =>
+        titleTokens.some((tokenTytulu) => tokenSimilarity(tokenMarkera.stem, tokenTytulu.stem) >= 0.90)
+      );
+      if (titleNorm.includes(markerNorm) || contextNorm.includes(markerNorm) || dopasowanieOdmiany) markerHits.push(marker);
     }
     let score = 100 * (1 - Math.exp(-evidence / 2.25));
     if (markerHits.length) score = Math.max(score, Math.min(100, 82 + (markerHits.length - 1) * 7));
@@ -812,6 +818,43 @@
   function titleContainsAdministrativeMorphology(title) {
     const tokens = normalize(title).split(' ').filter(Boolean);
     return tokens.some((token) => /^(?:administrac\w*|urzednik\w*|urzednic\w*|urzad|urzedu|urzedzie|urzedy|urzedach|urzedami|urzedow\w*)$/.test(token));
+  }
+
+  function tytulZawieraOdmianeWarsztatu(title) {
+    return normalize(title).split(' ').some((token) => /^warsztat\w*$/.test(token));
+  }
+
+  function zastosujJednoznaczneDopasowaniaNazwKategorii(results, title) {
+    const tokenyTytulu = classifierTokens(title);
+    if (!tokenyTytulu.length) return;
+
+    for (const wynik of results) {
+      const dopasowanyFragment = String(wynik.name || '')
+        .split('/')
+        .map((fragment) => fragment.trim())
+        .find((fragment) => {
+          const tokenyKategorii = classifierTokens(fragment);
+          return tokenyKategorii.length >= 2 && tokenyKategorii.every((tokenKategorii) =>
+            tokenyTytulu.some((tokenTytulu) => tokenSimilarity(tokenKategorii.stem, tokenTytulu.stem) >= 0.90)
+          );
+        });
+
+      if (!dopasowanyFragment) continue;
+      const pelnaNazwaWTytule = normalize(title).includes(normalize(dopasowanyFragment));
+      wynik.score = Math.max(wynik.score, pelnaNazwaWTytule ? 96 : 84);
+      wynik.hits = [...new Set([
+        ...(wynik.hits || []),
+        `${pelnaNazwaWTytule ? 'pełna nazwa' : 'nazwa'} kategorii: ${dopasowanyFragment}`
+      ])];
+    }
+  }
+
+  function zastosujReguleWarsztatowBiznesowych(results, title) {
+    if (!tytulZawieraOdmianeWarsztatu(title)) return;
+    const warsztatyBiznesowe = results.find((item) => item.id === 9);
+    if (!warsztatyBiznesowe) return;
+    warsztatyBiznesowe.score = Math.max(warsztatyBiznesowe.score, 76);
+    warsztatyBiznesowe.hits = [...new Set([...(warsztatyBiznesowe.hits || []), 'odmiana słowa „warsztat” w tytule'])];
   }
 
   function applyLegalCombinationRules(results, title) {
@@ -917,11 +960,13 @@
     ['czerwca', 6], ['czerwiec', 6],
     ['lipca', 7], ['lipiec', 7],
     ['sierpnia', 8], ['sierpien', 8], ['sierpień', 8],
-    ['wrzesnia', 9], ['wrzesień', 9], ['wrzesien', 9],
+    ['września', 9], ['wrzesnia', 9], ['wrzesień', 9], ['wrzesien', 9],
     ['pazdziernika', 10], ['października', 10], ['pazdziernik', 10], ['październik', 10],
     ['listopada', 11], ['listopad', 11],
     ['grudnia', 12], ['grudzien', 12], ['grudzień', 12]
   ]);
+
+  const WZOR_POLSKIEGO_MIESIACA = [...POLISH_MONTHS.keys()].join('|');
 
   function makeIsoDate(day, month, year) {
     const d = Number(day);
@@ -985,7 +1030,7 @@
         addCandidate(lineIndex, lineOffset, match.index || 0, match[0], makeIsoDate(match[3], match[2], match[1]));
       }
 
-      const words = /\b(\d{1,2})\s+(stycznia|styczen|styczeń|lutego|luty|marca|marzec|kwietnia|kwiecien|kwiecień|maja|maj|czerwca|czerwiec|lipca|lipiec|sierpnia|sierpien|sierpień|wrzesnia|wrzesien|wrzesień|pazdziernika|października|pazdziernik|październik|listopada|listopad|grudnia|grudzien|grudzień)\s+(20\d{2})(?:\s*r\.?\b)?/gi;
+      const words = new RegExp(`\\b(\\d{1,2})\\s+(${WZOR_POLSKIEGO_MIESIACA})\\s+(20\\d{2})(?:\\s*r\\.?\\b)?`, 'gi');
       for (const match of line.matchAll(words)) {
         const month = POLISH_MONTHS.get(String(match[2] || '').toLowerCase());
         addCandidate(lineIndex, lineOffset, match.index || 0, match[0], makeIsoDate(match[1], month, match[3]));
@@ -1498,6 +1543,8 @@
       };
     });
 
+    zastosujJednoznaczneDopasowaniaNazwKategorii(results, clean);
+    zastosujReguleWarsztatowBiznesowych(results, clean);
     applyCategoryPriorities(results);
     const derivedSuggestions = applyLegalCombinationRules(results, clean);
     applyAdministrativeMorphologyRule(results, clean);
@@ -1511,13 +1558,14 @@
       ? results.filter((item) => item.score >= 50 && item.id !== best.id).slice(0, 3)
       : [];
 
-    // Jawne odmiany słów „prawo” i „administracja/urzędnik” mają być zawsze
+    // Jawne odmiany słów „prawo”, „administracja/urzędnik” i „warsztat” mają być zawsze
     // widoczne w końcowej sugestii, nawet gdy przy bardzo złożonym tytule
     // wypadłyby poza trzy najwyższe kategorie dodatkowe.
     if (best) {
       const mandatoryIds = [];
       if (titleContainsLawMorphology(clean)) mandatoryIds.push(8);
       if (titleContainsAdministrativeMorphology(clean)) mandatoryIds.push(6);
+      if (tytulZawieraOdmianeWarsztatu(clean)) mandatoryIds.push(9);
       const mandatory = mandatoryIds
         .map((categoryId) => results.find((item) => item.id === categoryId && item.score >= 50))
         .filter((item) => item && item.id !== best.id);
@@ -2476,11 +2524,30 @@
     }
   }
 
+  function utworzOznaczenieWeryfikacji(zatwierdzone, rodzajPola) {
+    const oznaczenie = document.createElement('span');
+    oznaczenie.className = `semper-ref-approval-badge ${zatwierdzone ? 'zatwierdzone' : 'oczekujace'}`;
+    oznaczenie.textContent = zatwierdzone ? '✓ Ręcznie zatwierdzone' : '⌛ Do zatwierdzenia';
+    oznaczenie.title = zatwierdzone
+      ? `Pole „${rodzajPola}” zostało zatwierdzone ręcznie.`
+      : `Pole „${rodzajPola}” czeka na ręczne zatwierdzenie.`;
+    return oznaczenie;
+  }
+
+  function czyTytulZatwierdzonyRecznie(record) {
+    return Boolean(cleanTitle(record?.manualTitle || ''));
+  }
+
+  function czyDataZatwierdzonaRecznie(record) {
+    return Boolean(record?.issueDateApprovedAt || record?.issueDateSource === 'manual');
+  }
+
   function setTitleCell(cell, record) {
     cell.textContent = '';
     const title = record?.title || record?.detectedTitle || '';
     if (!title) {
       cell.innerHTML = '<span class="semper-ref-status-wait">Nieanalizowane</span>';
+      cell.appendChild(utworzOznaczenieWeryfikacji(false, 'Tytuł'));
       return;
     }
     const div = document.createElement('div');
@@ -2492,6 +2559,7 @@
     meta.style.fontSize = '11px';
     meta.textContent = `tytuł: ${record?.titleConfidence || 0}%`;
     cell.appendChild(meta);
+    cell.appendChild(utworzOznaczenieWeryfikacji(czyTytulZatwierdzonyRecznie(record), 'Tytuł'));
   }
 
   function setIssueDateCell(cell, record) {
@@ -2500,11 +2568,13 @@
     if (state === 'none') {
       cell.innerHTML = '<span class="semper-ref-status-wait">Brak</span>';
       cell.title = 'Użytkownik oznaczył, że dokument nie zawiera daty wystawienia.';
+      cell.appendChild(utworzOznaczenieWeryfikacji(czyDataZatwierdzonaRecznie(record), 'Data wystawienia'));
       return;
     }
     if (!record?.issueDate) {
       cell.innerHTML = '<span class="semper-ref-status-wait">Niewykryta</span>';
       cell.title = 'OCR nie wykrył wiarygodnej daty wystawienia dokumentu.';
+      cell.appendChild(utworzOznaczenieWeryfikacji(czyDataZatwierdzonaRecznie(record), 'Data wystawienia'));
       return;
     }
     const value = document.createElement('div');
@@ -2517,6 +2587,7 @@
       meta.textContent = `${record.issueDateConfidence || 0}%`;
       cell.appendChild(meta);
     }
+    cell.appendChild(utworzOznaczenieWeryfikacji(czyDataZatwierdzonaRecznie(record), 'Data wystawienia'));
   }
 
   function setSuggestionCell(cell, record) {
