@@ -23,7 +23,7 @@
 
   // Klasyfikator 3.0: hybrydowy model lokalny oparty na podobieństwie tytułów,
   // rdzeniach/fuzzy matching, publicznej ofercie SEMPER i zatwierdzonych decyzjach użytkownika.
-  const CLASSIFIER_VERSION = '3.2.2';
+  const CLASSIFIER_VERSION = '3.2.3';
   const KNOWLEDGE_CACHE_KEY = 'semper_classifier_knowledge_v3';
   const KNOWLEDGE_CACHE_TTL = 30 * 24 * 60 * 60 * 1000;
   const KNOWLEDGE_DISCOVERY_TTL = 7 * 24 * 60 * 60 * 1000;
@@ -234,7 +234,7 @@
     { id: 10, name: 'obsługa klienta', anchors: ['obsługa klienta', 'customer service', 'reklamacje', 'kontakt z klientem', 'trudny klient', 'pacjent jako klient'] },
     { id: 11, name: 'budownictwo', specificity: 1.06, anchors: ['budownictwo', 'budowlany', 'roboty budowlane', 'prawo budowlane', 'proces budowlany', 'proces inwestycyjny', 'kierownik budowy', 'obiekt budowlany', 'inwestycja budowlana', 'fidic', 'kosztorysowanie'] },
     { id: 12, name: 'księgowość / rachunkowość / podatki', anchors: ['rachunkowość', 'księgowość', 'sprawozdanie finansowe', 'vat', 'cit', 'pit', 'podatek', 'podatki', 'ksef', 'faktura', 'księga rachunkowa'] },
-    { id: 13, name: 'tematyka unijna', anchors: ['fundusze europejskie', 'fundusze unijne', 'projekty unijne', 'unia europejska', 'kpo', 'program operacyjny', 'perspektywa finansowa', 'kwalifikowalność wydatków', 'rozliczanie projektów unijnych'] },
+    { id: 13, name: 'tematyka unijna', anchors: ['fundusze europejskie', 'fundusze unijne', 'projekty unijne', 'unia europejska', 'europejski', 'kpo', 'program operacyjny', 'perspektywa finansowa', 'kwalifikowalność wydatków', 'rozliczanie projektów unijnych'] },
     { id: 14, name: 'kontrola zarządcza / finanse publ.', specificity: 1.05, anchors: ['kontrola zarządcza', 'finanse publiczne', 'dyscyplina finansów publicznych', 'zarządzanie ryzykiem', 'budżet jednostki', 'sektor finansów publicznych'] },
     { id: 15, name: 'szkolenia wyjazdowe', additional: true, anchors: ['szkolenie wyjazdowe', 'zakwaterowanie w cenie', 'noclegi i wyżywienie', 'szkolenie w zakopanem', 'szkolenie w kołobrzegu'] },
     { id: 17, name: 'ochrona środowiska / gosp. odpadami', specificity: 0.93, anchors: ['ochrona środowiska', 'środowisko', 'emisje', 'kobize', 'korzystanie ze środowiska', 'pozwolenie środowiskowe', 'prawo wodne', 'gospodarka wodna', 'opłaty środowiskowe'] },
@@ -824,6 +824,10 @@
     return normalize(title).split(' ').some((token) => /^warsztat\w*$/.test(token));
   }
 
+  function tytulZawieraTematykeUnijna(title) {
+    return normalize(title).split(' ').some((token) => /^(?:fe|ue|eu|europejsk\w*)$/.test(token));
+  }
+
   function zastosujJednoznaczneDopasowaniaNazwKategorii(results, title) {
     const tokenyTytulu = classifierTokens(title);
     if (!tokenyTytulu.length) return;
@@ -855,6 +859,14 @@
     if (!warsztatyBiznesowe) return;
     warsztatyBiznesowe.score = Math.max(warsztatyBiznesowe.score, 76);
     warsztatyBiznesowe.hits = [...new Set([...(warsztatyBiznesowe.hits || []), 'odmiana słowa „warsztat” w tytule'])];
+  }
+
+  function zastosujReguleTematykiUnijnej(results, title) {
+    if (!tytulZawieraTematykeUnijna(title)) return;
+    const tematykaUnijna = results.find((item) => item.id === 13);
+    if (!tematykaUnijna) return;
+    tematykaUnijna.score = Math.max(tematykaUnijna.score, 82);
+    tematykaUnijna.hits = [...new Set([...(tematykaUnijna.hits || []), 'FE/UE/EU lub odmiana słowa „europejski” w tytule'])];
   }
 
   function applyLegalCombinationRules(results, title) {
@@ -1545,6 +1557,7 @@
 
     zastosujJednoznaczneDopasowaniaNazwKategorii(results, clean);
     zastosujReguleWarsztatowBiznesowych(results, clean);
+    zastosujReguleTematykiUnijnej(results, clean);
     applyCategoryPriorities(results);
     const derivedSuggestions = applyLegalCombinationRules(results, clean);
     applyAdministrativeMorphologyRule(results, clean);
@@ -1558,7 +1571,7 @@
       ? results.filter((item) => item.score >= 50 && item.id !== best.id).slice(0, 3)
       : [];
 
-    // Jawne odmiany słów „prawo”, „administracja/urzędnik” i „warsztat” mają być zawsze
+    // Jawne odmiany słów kluczowych oraz skróty unijne mają być zawsze
     // widoczne w końcowej sugestii, nawet gdy przy bardzo złożonym tytule
     // wypadłyby poza trzy najwyższe kategorie dodatkowe.
     if (best) {
@@ -1566,6 +1579,7 @@
       if (titleContainsLawMorphology(clean)) mandatoryIds.push(8);
       if (titleContainsAdministrativeMorphology(clean)) mandatoryIds.push(6);
       if (tytulZawieraOdmianeWarsztatu(clean)) mandatoryIds.push(9);
+      if (tytulZawieraTematykeUnijna(clean)) mandatoryIds.push(13);
       const mandatory = mandatoryIds
         .map((categoryId) => results.find((item) => item.id === categoryId && item.score >= 50))
         .filter((item) => item && item.id !== best.id);
@@ -3957,6 +3971,9 @@
       renderOcrWithHighlights(ocrText, record.ocrText || '', record.detectedTitle || record.title || '', manualHighlight, {
         iso: record.issueDate || '',
         raw: record.issueDateRaw || ''
+      }, false);
+      requestAnimationFrame(() => {
+        ocrText.scrollTop = 0;
       });
       savedTitleValue = cleanTitle(titleInput.value);
       savedOcrValue = getEditableOcrText(ocrText);
