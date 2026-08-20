@@ -2,8 +2,10 @@
   'use strict';
 
   const KLUCZ_STANU_WTYCZKI = 'semper_stan_wtyczki_v1';
+  const KLUCZ_AUTOAKCEPTACJI_KATEGORII = 'semper_autoakceptacja_kategorii_v1';
   const poleStanu = document.getElementById('stan');
   const przyciskWlaczenia = document.getElementById('wlacz');
+  const poleAutoakceptacji = document.getElementById('autoakceptacja-kategorii');
 
   function formatujDate(czas) {
     return new Intl.DateTimeFormat('pl-PL', {
@@ -15,7 +17,9 @@
   }
 
   async function pokazStan() {
-    const stan = (await chrome.storage.local.get(KLUCZ_STANU_WTYCZKI))[KLUCZ_STANU_WTYCZKI];
+    const zapis = await chrome.storage.local.get([KLUCZ_STANU_WTYCZKI, KLUCZ_AUTOAKCEPTACJI_KATEGORII]);
+    const stan = zapis[KLUCZ_STANU_WTYCZKI];
+    const autoakceptacja = zapis[KLUCZ_AUTOAKCEPTACJI_KATEGORII];
     const czasWylaczenia = Number(stan?.wylaczoneDo) || 0;
     const wylaczonaBezterminowo = stan?.tryb === 'bezterminowo';
     const wylaczonaCzasowo = stan?.tryb === 'czasowo' && czasWylaczenia > Date.now();
@@ -26,6 +30,16 @@
     if (wylaczonaBezterminowo) poleStanu.textContent = 'Wtyczka wyłączona do ponownego włączenia';
     else if (wylaczonaCzasowo) poleStanu.textContent = `Wtyczka wyłączona do ${formatujDate(czasWylaczenia)}`;
     else poleStanu.textContent = 'Wtyczka jest włączona';
+    poleAutoakceptacji.checked = autoakceptacja?.wlaczona === true;
+  }
+
+  async function ustawAutoakceptacje() {
+    await chrome.storage.local.set({
+      [KLUCZ_AUTOAKCEPTACJI_KATEGORII]: {
+        wlaczona: poleAutoakceptacji.checked,
+        zmienionoAt: Date.now()
+      }
+    });
   }
 
   async function wylaczCzasowo(minuty) {
@@ -55,6 +69,7 @@
   });
   document.getElementById('wylacz-bezterminowo').addEventListener('click', wylaczBezterminowo);
   przyciskWlaczenia.addEventListener('click', wlacz);
+  poleAutoakceptacji.addEventListener('change', ustawAutoakceptacje);
 
   pokazStan();
 })();

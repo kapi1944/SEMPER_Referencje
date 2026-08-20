@@ -20,10 +20,24 @@
   const PENDING_CATEGORY_SAVE_KEY = 'semper_category_save_pending_v1';
   const AFTER_SAVE_SORT_KEY = 'semper_ref_after_save_sort_v3';
   const AFTER_SAVE_SORT_DEFAULT = ''; // domyślnie bieżąca data RRMMDD
+  const KLUCZ_AUTOAKCEPTACJI_KATEGORII = 'semper_autoakceptacja_kategorii_v1';
 
   // Klasyfikator 3.0: hybrydowy model lokalny oparty na podobieństwie tytułów,
   // rdzeniach/fuzzy matching, publicznej ofercie SEMPER i zatwierdzonych decyzjach użytkownika.
-  const CLASSIFIER_VERSION = '3.2.3';
+  const CLASSIFIER_VERSION = '3.2.6';
+  const PROG_KATEGORII_GLOWNEJ = 70;
+  const PROG_MALEJ_PRZEWAGI_P_P = 10;
+  const PROG_PODOBIENSTWA_ZNANEGO_SZKOLENIA = 0.72;
+  const LIMIT_DOPASOWAN_ZNANEGO_SZKOLENIA = 8;
+  const LIMIT_KANDYDATOW_ZNANEGO_SZKOLENIA = 32;
+  const ID_TOOLTIPU_UZASADNIENIA = 'semper-tooltip-uzasadnienia';
+  const KONFIGURACJA_AUTOAKCEPTACJI = Object.freeze({
+    wlaczona: false,
+    minimalnaPewnoscOcr: 95,
+    minimalnaPewnoscTytulu: 95,
+    minimalnyWynikKategoriiGlownej: 95,
+    minimalnaPrzewagaPunktowProcentowych: 15
+  });
   const KNOWLEDGE_CACHE_KEY = 'semper_classifier_knowledge_v3';
   const KNOWLEDGE_CACHE_TTL = 30 * 24 * 60 * 60 * 1000;
   const KNOWLEDGE_DISCOVERY_TTL = 7 * 24 * 60 * 60 * 1000;
@@ -32,6 +46,9 @@
 
   let classifierKnowledge = { examples: [], profiles: {}, updatedAt: 0, discoveredAt: 0, pendingUrls: [] };
   let learnedExamples = [];
+  let indeksZnanychSzkolen = { przyklady: [], dokladne: new Map() };
+  let najnowszeZatwierdzenieKategoriiAt = 0;
+  const trwajaceAutoakceptacje = new Map();
   let classifierInitPromise = null;
   let knowledgeSyncPromise = null;
 
@@ -445,6 +462,290 @@
     return Math.max(0, Math.min(1, (tokenF1 * 0.60) + (chars * 0.24) + (bigramOverlap * 0.16)));
   }
 
+  const POMIJANE_RDZENIE_DOPASOWANIA_TYTULU = new Set([
+    'rok', 'roku', 'lata', 'edycja', 'wersja', 'modul', 'program', 'zmiana', 'zmiany', 'nowosc', 'nowosci',
+    'nowy', 'nowa', 'nowe', 'najnowszy', 'najnowsza', 'najnowsze', 'nowelizacja'
+  ].map(stemToken));
+
+  function normalizujTytulZnaneSzkolenie(tytul) {
+    return normalize(cleanTitle(tytul));
+  }
+
+  function normalizujTytulDoPodobienstwa(tytul) {
+    return normalizujTytulZnaneSzkolenie(tytul)
+      .split(' ')
+      .filter((wyraz) => !/^(?:19|20)\d{2}$/.test(wyraz)
+        && !CLASSIFIER_STOPWORDS.has(wyraz)
+        && !POMIJANE_RDZENIE_DOPASOWANIA_TYTULU.has(stemToken(wyraz)))
+      .join(' ');
+  }
+
+  function tokenyTematyczneTytulu(tytul) {
+    const widziane = new Set();
+    return classifierTokens(normalizujTytulDoPodobienstwa(tytul))
+      .map((token) => token.stem)
+      .filter((rdzen) => {
+        if (!rdzen || /^\d+$/.test(rdzen) || POMIJANE_RDZENIE_DOPASOWANIA_TYTULU.has(rdzen) || widziane.has(rdzen)) return false;
+        widziane.add(rdzen);
+        return true;
+      });
+  }
+
+  function nazwyKategoriiPrzykladu(przyklad, kategorie) {
+    const zapisaneNazwy = Array.isArray(przyklad?.categoryNames)
+      ? przyklad.categoryNames
+      : Array.isArray(przyklad?.nazwyKategorii)
+        ? przyklad.nazwyKategorii
+        : [];
+    if (zapisaneNazwy.length) return [...new Set(zapisaneNazwy.map(String).filter(Boolean))];
+    return kategorie.map((identyfikator) => categoryById(identyfikator)?.name || `Kategoria ${identyfikator}`);
+  }
+
+  function przygotujPrzykladZnaneSzkolenie(przyklad) {
+    if (przyklad?.wiarygodny === false || (przyklad?.source === 'user' && !Number(przyklad?.approvedAt || przyklad?.zatwierdzoneAt || 0))) return null;
+    const tytul = cleanTitle(przyklad?.title || przyklad?.tytul || '');
+    const kategorie = [...new Set((przyklad?.categories || przyklad?.kategorie || []).map(Number).filter(Boolean))];
+    if (!tytul || !kategorie.length) return null;
+    return {
+      ...przyklad,
+      id: String(przyklad?.id || ''),
+      title: tytul,
+      categories: kategorie,
+      categoryNames: nazwyKategoriiPrzykladu(przyklad, kategorie),
+      znormalizowanyTytul: normalizujTytulZnaneSzkolenie(tytul),
+      tytulDoPodobienstwa: normalizujTytulDoPodobienstwa(tytul),
+      tokenyTematyczne: tokenyTematyczneTytulu(tytul),
+      ngramyTytulu: charNgrams(normalizujTytulDoPodobienstwa(tytul))
+    };
+  }
+
+  function zbudujIndeksZnanychSzkolen(przyklady) {
+    const przygotowane = (Array.isArray(przyklady) ? przyklady : [])
+      .map(przygotujPrzykladZnaneSzkolenie)
+      .filter(Boolean);
+    const dokladne = new Map();
+    const poId = new Map();
+    for (const przyklad of przygotowane) {
+      if (!dokladne.has(przyklad.znormalizowanyTytul)) dokladne.set(przyklad.znormalizowanyTytul, []);
+      dokladne.get(przyklad.znormalizowanyTytul).push(przyklad);
+      if (przyklad.id) poId.set(String(przyklad.id), przyklad);
+    }
+    return { przyklady: przygotowane, dokladne, poId };
+  }
+
+  function obliczPokrycieTematyczne(leweTokeny, praweTokeny) {
+    if (!leweTokeny.length || !praweTokeny.length) return { wspolne: 0, f1: 0, pokrycieKrotszego: 0 };
+    const wykorzystane = new Set();
+    let wspolne = 0;
+    for (const lewy of leweTokeny) {
+      let najlepszyIndeks = -1;
+      let najlepszyWynik = 0;
+      for (let indeks = 0; indeks < praweTokeny.length; indeks += 1) {
+        if (wykorzystane.has(indeks)) continue;
+        const wynik = tokenSimilarity(lewy, praweTokeny[indeks]);
+        if (wynik > najlepszyWynik) {
+          najlepszyWynik = wynik;
+          najlepszyIndeks = indeks;
+        }
+      }
+      if (najlepszyIndeks >= 0 && najlepszyWynik >= 0.90) {
+        wykorzystane.add(najlepszyIndeks);
+        wspolne += 1;
+      }
+    }
+    const precyzja = wspolne / leweTokeny.length;
+    const czulosc = wspolne / praweTokeny.length;
+    return {
+      wspolne,
+      f1: precyzja + czulosc ? (2 * precyzja * czulosc) / (precyzja + czulosc) : 0,
+      pokrycieKrotszego: wspolne / Math.min(leweTokeny.length, praweTokeny.length)
+    };
+  }
+
+  function czyTematWystarczajacoZgodny(pokrycie, leweTokeny, praweTokeny) {
+    if (pokrycie.wspolne >= 2 && pokrycie.f1 >= 0.80) return true;
+    return pokrycie.wspolne === 1 && leweTokeny.length === 1 && praweTokeny.length === 1;
+  }
+
+  function kluczZestawuKategorii(kategorie) {
+    return [...new Set((kategorie || []).map(Number).filter(Boolean))].sort((a, b) => a - b).join(',');
+  }
+
+  function brakZnaneSzkolenie() {
+    return {
+      znaleziono: false,
+      rodzaj: 'brak',
+      podtyp: '',
+      podobienstwo: 0,
+      konflikt: false,
+      kategorie: [],
+      nazwyKategorii: [],
+      dopasowania: [],
+      liczbaDopasowan: 0,
+      grupyKategorii: [],
+      wiekszosc: null,
+      zgodnoscPelna: false
+    };
+  }
+
+  function wybierzKandydatowZnaneSzkolenie(indeks, tytulDoPodobienstwa, opcje, czyDozwolony) {
+    if (Array.isArray(opcje?.kandydaciPrzyblizeni)) {
+      const kandydaci = opcje.kandydaciPrzyblizeni
+        .map((kandydat) => indeks.poId?.get(String(kandydat?.id || '')) || przygotujPrzykladZnaneSzkolenie(kandydat))
+        .filter((kandydat) => kandydat && czyDozwolony(kandydat));
+      if (kandydaci.length) return kandydaci.slice(0, LIMIT_KANDYDATOW_ZNANEGO_SZKOLENIA);
+    }
+
+    const ngramyTytulu = charNgrams(tytulDoPodobienstwa);
+    return indeks.przyklady
+      .filter(czyDozwolony)
+      .map((przyklad) => ({
+        przyklad,
+        wynikWstepny: diceCoefficient(ngramyTytulu, przyklad.ngramyTytulu || charNgrams(przyklad.tytulDoPodobienstwa))
+      }))
+      .filter((ocena) => ocena.wynikWstepny >= 0.24)
+      .sort((a, b) => b.wynikWstepny - a.wynikWstepny)
+      .slice(0, LIMIT_KANDYDATOW_ZNANEGO_SZKOLENIA)
+      .map((ocena) => ocena.przyklad);
+  }
+
+  function znajdzZnaneSzkolenie(tytul, historia = indeksZnanychSzkolen, opcje = {}) {
+    const znormalizowanyTytul = normalizujTytulZnaneSzkolenie(tytul);
+    if (!znormalizowanyTytul) return brakZnaneSzkolenie();
+    const indeks = Array.isArray(historia) ? zbudujIndeksZnanychSzkolen(historia) : historia;
+    if (!indeks?.dokladne || !Array.isArray(indeks?.przyklady)) return brakZnaneSzkolenie();
+    const pominId = String(opcje?.pominId || '');
+    const czyDozwolony = (przyklad) => !pominId || String(przyklad.id) !== pominId;
+    const dokladne = (indeks.dokladne.get(znormalizowanyTytul) || []).filter(czyDozwolony);
+    let oceny = dokladne.map((przyklad) => ({
+      przyklad,
+      rodzaj: 'dokladne',
+      podtyp: cleanTitle(tytul) === cleanTitle(przyklad.title) ? 'identyczne' : 'po-normalizacji',
+      podobienstwo: 1
+    })).sort((a, b) => Number(Boolean(b.przyklad.tytulZatwierdzonyRecznie)) - Number(Boolean(a.przyklad.tytulZatwierdzonyRecznie))
+      || Number(b.przyklad.approvedAt || 0) - Number(a.przyklad.approvedAt || 0));
+
+    if (!oceny.length) {
+      const tytulDoPodobienstwa = normalizujTytulDoPodobienstwa(tytul);
+      const tokenyTematyczne = tokenyTematyczneTytulu(tytul);
+      const kandydaci = wybierzKandydatowZnaneSzkolenie(indeks, tytulDoPodobienstwa, opcje, czyDozwolony);
+      oceny = kandydaci
+        .map((przyklad) => {
+          const podobienstwo = titleSimilarity(tytulDoPodobienstwa, przyklad.tytulDoPodobienstwa);
+          const pokrycieTematyczne = obliczPokrycieTematyczne(tokenyTematyczne, przyklad.tokenyTematyczne);
+          if (podobienstwo < PROG_PODOBIENSTWA_ZNANEGO_SZKOLENIA
+            || !czyTematWystarczajacoZgodny(pokrycieTematyczne, tokenyTematyczne, przyklad.tokenyTematyczne)) return null;
+          return {
+            przyklad,
+            rodzaj: 'przyblizone',
+            podtyp: 'bardzo-podobne',
+            podobienstwo: Math.min(0.99, podobienstwo),
+            pokrycieTematyczne
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.podobienstwo - a.podobienstwo
+          || Number(Boolean(b.przyklad.tytulZatwierdzonyRecznie)) - Number(Boolean(a.przyklad.tytulZatwierdzonyRecznie))
+          || Number(b.przyklad.approvedAt || 0) - Number(a.przyklad.approvedAt || 0))
+        .slice(0, LIMIT_DOPASOWAN_ZNANEGO_SZKOLENIA);
+    }
+
+    if (!oceny.length) return brakZnaneSzkolenie();
+    const wszystkieDopasowania = oceny.map((ocena) => ({
+      id: ocena.przyklad.id,
+      tytul: ocena.przyklad.title,
+      rodzaj: ocena.rodzaj,
+      podtyp: ocena.podtyp,
+      podobienstwo: ocena.podobienstwo,
+      kategorie: [...ocena.przyklad.categories],
+      nazwyKategorii: [...ocena.przyklad.categoryNames],
+      zrodloZatwierdzenia: ocena.przyklad.zrodloZatwierdzenia || 'reczne',
+      zatwierdzoneAt: Number(ocena.przyklad.approvedAt || ocena.przyklad.zatwierdzoneAt || 0)
+    }));
+    const grupy = new Map();
+    for (const dopasowanie of wszystkieDopasowania) {
+      const klucz = kluczZestawuKategorii(dopasowanie.kategorie);
+      if (!grupy.has(klucz)) grupy.set(klucz, { kategorie: dopasowanie.kategorie, nazwyKategorii: dopasowanie.nazwyKategorii, rekordy: [] });
+      grupy.get(klucz).rekordy.push(dopasowanie.id);
+    }
+    const grupyKategorii = [...grupy.values()].sort((a, b) => b.rekordy.length - a.rekordy.length);
+    const konflikt = grupyKategorii.length > 1;
+    const zgodnaGrupa = konflikt ? null : grupyKategorii[0];
+    const najliczniejszaGrupa = grupyKategorii[0] || null;
+    const wiekszosc = najliczniejszaGrupa && najliczniejszaGrupa.rekordy.length > wszystkieDopasowania.length / 2
+      ? {
+          kategorie: [...najliczniejszaGrupa.kategorie],
+          nazwyKategorii: [...najliczniejszaGrupa.nazwyKategorii],
+          liczba: najliczniejszaGrupa.rekordy.length,
+          zeWszystkich: wszystkieDopasowania.length
+        }
+      : null;
+    const dopasowania = wszystkieDopasowania.slice(0, LIMIT_DOPASOWAN_ZNANEGO_SZKOLENIA);
+    return {
+      znaleziono: true,
+      rodzaj: oceny[0].rodzaj,
+      podtyp: oceny[0].podtyp,
+      podobienstwo: oceny[0].podobienstwo,
+      konflikt,
+      kategorie: zgodnaGrupa ? [...zgodnaGrupa.kategorie] : [],
+      nazwyKategorii: zgodnaGrupa ? [...zgodnaGrupa.nazwyKategorii] : [],
+      dopasowania,
+      liczbaDopasowan: wszystkieDopasowania.length,
+      grupyKategorii,
+      wiekszosc,
+      zgodnoscPelna: !konflikt
+    };
+  }
+
+  function obliczWynikiZatwierdzonychPrzykladow(dopasowania) {
+    const wiarygodne = (Array.isArray(dopasowania) ? dopasowania : [])
+      .filter((dopasowanie) => Number(dopasowanie?.podobienstwo) >= PROG_PODOBIENSTWA_ZNANEGO_SZKOLENIA
+        && dopasowanie?.zrodloZatwierdzenia !== 'automatyczne'
+        && Array.isArray(dopasowanie?.kategorie)
+        && dopasowanie.kategorie.length);
+    const wsparcie = new Map();
+    for (const dopasowanie of wiarygodne) {
+      const podobienstwo = Math.max(0, Math.min(1, Number(dopasowanie.podobienstwo) || 0));
+      const wynikPodobienstwa = Math.max(0, Math.min(100, ((podobienstwo - 0.30) / 0.70) * 100));
+      for (const identyfikatorKategorii of new Set(dopasowanie.kategorie.map(Number).filter(Boolean))) {
+        if (!wsparcie.has(identyfikatorKategorii)) wsparcie.set(identyfikatorKategorii, []);
+        wsparcie.get(identyfikatorKategorii).push(wynikPodobienstwa);
+      }
+    }
+
+    const wyniki = new Map();
+    for (const [identyfikatorKategorii, wartosci] of wsparcie) {
+      const srednia = wartosci.reduce((suma, wartosc) => suma + wartosc, 0) / wartosci.length;
+      const udzialZgodnychDecyzji = wartosci.length / wiarygodne.length;
+      const wspolczynnikKonfliktu = 0.5 + (udzialZgodnychDecyzji * 0.5);
+      const premiaZaPowtorzenie = Math.min(8, Math.max(0, wartosci.length - 1) * 3);
+      wyniki.set(identyfikatorKategorii, Math.max(0, Math.min(100,
+        (srednia * wspolczynnikKonfliktu) + premiaZaPowtorzenie
+      )));
+    }
+    return wyniki;
+  }
+
+  function zastosujZgodnaHistorieZatwierdzen(wyniki, znaneSzkolenie) {
+    const maSwiadomaDecyzje = znaneSzkolenie?.dopasowania?.some((dopasowanie) => dopasowanie.zrodloZatwierdzenia !== 'automatyczne');
+    if (!znaneSzkolenie?.znaleziono || znaneSzkolenie.konflikt || !znaneSzkolenie.kategorie?.length || !maSwiadomaDecyzje) return;
+    const zatwierdzoneKategorie = new Set(znaneSzkolenie.kategorie.map(Number).filter(Boolean));
+    const podobienstwo = Math.max(PROG_PODOBIENSTWA_ZNANEGO_SZKOLENIA,
+      Math.min(1, Number(znaneSzkolenie.podobienstwo) || 0));
+    const silaHistorii = (podobienstwo - PROG_PODOBIENSTWA_ZNANEGO_SZKOLENIA)
+      / (1 - PROG_PODOBIENSTWA_ZNANEGO_SZKOLENIA);
+    const minimalnyWynikZatwierdzonejKategorii = 70 + (silaHistorii * 30);
+    const wspolczynnikPozostalychKategorii = 1 - (silaHistorii * 0.20);
+
+    for (const wynik of wyniki) {
+      if (zatwierdzoneKategorie.has(Number(wynik.id))) {
+        wynik.score = Math.max(wynik.score, Math.round(minimalnyWynikZatwierdzonejKategorii));
+      } else {
+        wynik.score = Math.round(wynik.score * wspolczynnikPozostalychKategorii);
+      }
+    }
+  }
+
   function categoryById(id) {
     return CATEGORIES.find((category) => String(category.id) === String(id)) || null;
   }
@@ -548,18 +849,30 @@
     try {
       const all = await chrome.storage.local.get(null);
       learnedExamples = Object.entries(all)
-        .filter(([key, value]) => key.startsWith(STORAGE_PREFIX) && value?.title && Array.isArray(value?.approvedCategoryIds) && value.approvedCategoryIds.length)
+        .filter(([key, value]) => key.startsWith(STORAGE_PREFIX)
+          && (value?.manualTitle || value?.title || value?.detectedTitle)
+          && value?.approvedCategoriesAt
+          && Array.isArray(value?.approvedCategoryIds)
+          && value.approvedCategoryIds.length)
         .map(([key, value]) => ({
           id: key.slice(STORAGE_PREFIX.length),
           title: value.manualTitle || value.title || value.detectedTitle,
           categories: value.approvedCategoryIds.map(Number).filter(Boolean),
+          categoryNames: Array.isArray(value.approvedCategoryNames) ? value.approvedCategoryNames : [],
+          approvedAt: Number(value.approvedCategoriesAt || 0),
+          tytulZatwierdzonyRecznie: Boolean(value.manualTitle || value.titleApprovedAt),
+          zrodloZatwierdzenia: value.zrodloZatwierdzeniaKategorii || 'reczne',
           source: 'user'
         }))
         .filter((item) => item.title && item.categories.length)
         .slice(-500);
+      indeksZnanychSzkolen = zbudujIndeksZnanychSzkolen(learnedExamples);
+      najnowszeZatwierdzenieKategoriiAt = learnedExamples.reduce((najnowsze, przyklad) => Math.max(najnowsze, przyklad.approvedAt || 0), 0);
     } catch (error) {
       console.warn('[SEMPER OCR] Nie udało się wczytać przykładów użytkownika.', error);
       learnedExamples = [];
+      indeksZnanychSzkolen = zbudujIndeksZnanychSzkolen([]);
+      najnowszeZatwierdzenieKategoriiAt = 0;
     }
     return learnedExamples;
   }
@@ -698,25 +1011,19 @@
     return { scores, examples: bestExamples.slice(0, 5) };
   }
 
-  function learnedExampleScores(title) {
-    const support = new Map();
-    const bestExamples = [];
-    for (const example of learnedExamples || []) {
-      const similarity = titleSimilarity(title, example.title);
-      if (similarity < 0.30) continue;
-      bestExamples.push({ ...example, similarity });
-      for (const categoryId of example.categories || []) {
-        const current = support.get(Number(categoryId)) || 0;
-        support.set(Number(categoryId), Math.max(current, similarity));
-      }
-    }
-    const scores = new Map();
-    for (const [categoryId, similarity] of support) {
-      const calibrated = similarity <= 0.30 ? 0 : Math.min(100, ((similarity - 0.30) / 0.70) * 100);
-      scores.set(categoryId, calibrated);
-    }
-    bestExamples.sort((a, b) => b.similarity - a.similarity);
-    return { scores, examples: bestExamples.slice(0, 4) };
+  function learnedExampleScores(title, pominId = '', znaneSzkolenie = null) {
+    const historia = znaneSzkolenie || znajdzZnaneSzkolenie(title, indeksZnanychSzkolen, { pominId });
+    const dopasowania = historia?.dopasowania || [];
+    const scores = obliczWynikiZatwierdzonychPrzykladow(dopasowania);
+    const examples = dopasowania.map((dopasowanie) => ({
+      id: dopasowanie.id,
+      title: dopasowanie.tytul,
+      categories: [...dopasowanie.kategorie],
+      categoryNames: [...dopasowanie.nazwyKategorii],
+      similarity: dopasowanie.podobienstwo,
+      approvedAt: dopasowanie.zatwierdzoneAt
+    }));
+    return { scores, examples };
   }
 
   function anchorMatchScore(category, title, ocrText = '') {
@@ -936,7 +1243,7 @@
 
   function knowledgeSummary() {
     const publicCount = classifierKnowledge.examples?.length || 0;
-    const userCount = learnedExamples?.length || 0;
+    const userCount = (learnedExamples || []).filter((przyklad) => przyklad.zrodloZatwierdzenia !== 'automatyczne').length;
     const pending = classifierKnowledge.pendingUrls?.length || 0;
     return { publicCount, userCount, pending };
   }
@@ -1510,10 +1817,14 @@
     return { title: best.title, confidence, source: best.source, candidates: ranked.slice(0, 5) };
   }
 
-  function classify(title, ocrText = '') {
+  function classify(title, ocrText = '', opcje = {}) {
     const clean = cleanTitle(title);
     const publicData = publicExampleScores(clean);
-    const learnedData = learnedExampleScores(clean);
+    const indeksHistorii = opcje?.indeksHistorii || indeksZnanychSzkolen;
+    const znaneSzkolenie = znajdzZnaneSzkolenie(clean, indeksHistorii, {
+      pominId: opcje?.pominId
+    });
+    const learnedData = learnedExampleScores(clean, opcje?.pominId, znaneSzkolenie);
     const results = CATEGORIES.map((category) => {
       const anchor = anchorMatchScore(category, clean, ocrText);
       const publicScore = publicData.scores.get(category.id) || 0;
@@ -1561,12 +1872,13 @@
     applyCategoryPriorities(results);
     const derivedSuggestions = applyLegalCombinationRules(results, clean);
     applyAdministrativeMorphologyRule(results, clean);
+    zastosujZgodnaHistorieZatwierdzen(results, znaneSzkolenie);
     results.sort((a, b) => b.score - a.score || a.id - b.id);
 
     const mainCandidates = results.filter((item) => !item.additional);
     const top = mainCandidates[0] || null;
-    const best = top && top.score >= 70 ? top : null;
-    const second = mainCandidates.find((item) => !best || item.id !== best.id) || null;
+    const best = top && top.score >= PROG_KATEGORII_GLOWNEJ ? top : null;
+    const second = mainCandidates[1] || null;
     let additional = best
       ? results.filter((item) => item.score >= 50 && item.id !== best.id).slice(0, 3)
       : [];
@@ -1617,18 +1929,139 @@
       second,
       additional,
       level,
-      status: best ? 'Automatycznie zaakceptowano' : 'Wymaga ręcznej weryfikacji',
+      status: znaneSzkolenie.konflikt ? 'Wymaga decyzji' : best ? 'Sklasyfikowana' : 'Wymaga decyzji',
       results: results.slice(0, 10),
       closestPublic,
       closestUser,
+      znaneSzkolenie,
+      historiaZatwierdzonaAt: najnowszeZatwierdzenieKategoriiAt,
       derivedSuggestions,
       knowledge: knowledgeSummary()
+    };
+  }
+
+  function polaczKonfiguracjeAutoakceptacji(nadpisanie = {}) {
+    return { ...KONFIGURACJA_AUTOAKCEPTACJI, ...(nadpisanie || {}) };
+  }
+
+  async function pobierzKonfiguracjeAutoakceptacji() {
+    const zapis = (await chrome.storage.local.get(KLUCZ_AUTOAKCEPTACJI_KATEGORII))[KLUCZ_AUTOAKCEPTACJI_KATEGORII];
+    return polaczKonfiguracjeAutoakceptacji({ wlaczona: zapis?.wlaczona === true });
+  }
+
+  function zablokujAutoakceptacje(powod, szczegoly = {}) {
+    return { mozliwa: false, powod, identyfikatoryKategorii: [], ...szczegoly };
+  }
+
+  function czyDaneAutoakceptacjiSaKompletne(rekord) {
+    const klasyfikacja = rekord?.classification;
+    const tytulWykryty = cleanTitle(rekord?.detectedTitle || '');
+    const tytulKlasyfikacji = cleanTitle(klasyfikacja?.title || '');
+    const probyOcr = Array.isArray(rekord?.ocrAttempts) ? rekord.ocrAttempts : [];
+    const kandydaciTytulu = Array.isArray(rekord?.titleCandidates) ? rekord.titleCandidates : [];
+    const probaOcr = probyOcr.find((proba) => proba?.variant === rekord?.ocrVariant);
+    const kandydatTytulu = kandydaciTytulu.find((kandydat) => normalize(kandydat?.title || '') === normalize(tytulWykryty));
+    return Boolean(
+      rekord?.imageUrl
+      && rekord?.ocrZakonczonyAt
+      && String(rekord?.ocrText || '').trim()
+      && rekord?.ocrVariant
+      && Array.isArray(rekord?.ocrAttempts)
+      && rekord.ocrAttempts.length
+      && probaOcr
+      && odczytajProcent(probaOcr.confidence) !== null
+      && tytulWykryty
+      && rekord?.titleSource
+      && kandydatTytulu
+      && klasyfikacja?.version === CLASSIFIER_VERSION
+      && rekord?.classifierVersion === CLASSIFIER_VERSION
+      && rekord?.klasyfikacjaUtworzonaAt
+      && Array.isArray(klasyfikacja?.results)
+      && klasyfikacja.results.length
+      && klasyfikacja?.best
+      && normalize(tytulWykryty) === normalize(tytulKlasyfikacji)
+    );
+  }
+
+  function ocenWarunkiAutoakceptacji(rekord, opcje = {}) {
+    const konfiguracja = polaczKonfiguracjeAutoakceptacji(opcje.konfiguracja || opcje);
+    if (!konfiguracja.wlaczona) return zablokujAutoakceptacje('funkcja-wylaczona');
+    if (rekord?.approvedCategoriesAt || rekord?.zrodloZatwierdzeniaKategorii) {
+      return zablokujAutoakceptacje('juz-zatwierdzona');
+    }
+    if (String(rekord?.bladOcr || '').trim()) return zablokujAutoakceptacje('blad-ocr');
+    if (!czyDaneAutoakceptacjiSaKompletne(rekord)) return zablokujAutoakceptacje('niepelne-dane');
+    if (cleanTitle(rekord?.manualTitle || '')) return zablokujAutoakceptacje('tytul-reczny');
+
+    const pewnoscOcr = odczytajProcent(rekord?.ocrConfidence);
+    if (pewnoscOcr === null || pewnoscOcr < konfiguracja.minimalnaPewnoscOcr) {
+      return zablokujAutoakceptacje('za-slaby-ocr', { pewnoscOcr });
+    }
+    const pewnoscTytulu = odczytajProcent(rekord?.titleConfidence);
+    if (pewnoscTytulu === null || pewnoscTytulu < konfiguracja.minimalnaPewnoscTytulu) {
+      return zablokujAutoakceptacje('za-slabe-wykrycie-tytulu', { pewnoscTytulu });
+    }
+
+    const klasyfikacja = rekord.classification;
+    const wynikGlowny = odczytajProcent(klasyfikacja.best?.score);
+    if (wynikGlowny === null || wynikGlowny < konfiguracja.minimalnyWynikKategoriiGlownej) {
+      return zablokujAutoakceptacje('za-slaba-kategoria-glowna', { wynikGlowny });
+    }
+    if (klasyfikacja.znaneSzkolenie?.konflikt) return zablokujAutoakceptacje('konflikt-historyczny');
+
+    const przewaga = obliczPrzewageKlasyfikacji(klasyfikacja);
+    if (przewaga && przewaga.roznicaPunktowProcentowych < konfiguracja.minimalnaPrzewagaPunktowProcentowych) {
+      return zablokujAutoakceptacje('za-mala-przewaga', {
+        przewagaPunktowProcentowych: przewaga.roznicaPunktowProcentowych
+      });
+    }
+    if (/wymaga.*(?:decyzji|weryfikacji)/i.test(String(klasyfikacja.status || ''))
+      || czyKlasyfikacjaWymagaDecyzji(klasyfikacja)) {
+      return zablokujAutoakceptacje('wymaga-decyzji');
+    }
+
+    const przypisaneKategorie = opcje.przypisaneKategorie;
+    if (Array.isArray(przypisaneKategorie?.ids) && przypisaneKategorie.ids.length) {
+      return zablokujAutoakceptacje('istniejace-kategorie');
+    }
+    const stanReferencji = wyliczStanReferencji({ rekord, przypisaneKategorie });
+    if (stanReferencji.klucz === 'wymaga-decyzji' || stanReferencji.klucz === 'blad-ocr') {
+      return zablokujAutoakceptacje('wymaga-decyzji');
+    }
+    const identyfikatoryKategorii = [...new Set(wynikiSugestiiKlasyfikacji(klasyfikacja)
+      .map((wynik) => String(wynik.id || ''))
+      .filter(Boolean))];
+    if (!identyfikatoryKategorii.length) return zablokujAutoakceptacje('brak-kategorii-do-zapisu');
+
+    return {
+      mozliwa: true,
+      powod: '',
+      identyfikatoryKategorii,
+      pewnoscOcr,
+      pewnoscTytulu,
+      wynikGlowny,
+      wynikDrugiejKategorii: odczytajProcent(przewaga?.drugiWynik?.score),
+      przewagaPunktowProcentowych: przewaga?.roznicaPunktowProcentowych ?? null
     };
   }
 
   window.__SEMPER_CLASSIFIER_V3__ = Object.freeze({
     version: CLASSIFIER_VERSION,
     classify,
+    wynikiSugestiiKlasyfikacji,
+    obliczPrzewageKlasyfikacji,
+    wyliczStanReferencji,
+    normalizujTytulZnaneSzkolenie,
+    zbudujIndeksZnanychSzkolen,
+    znajdzZnaneSzkolenie,
+    obliczWynikiZatwierdzonychPrzykladow,
+    ocenWarunkiAutoakceptacji,
+    sprobujAutomatycznieZatwierdzicKategorie,
+    KONFIGURACJA_AUTOAKCEPTACJI,
+    uzasadnienieWynikuKlasyfikacji,
+    kolejkujPrzypisanieKategorii,
+    odczytajProcent,
+    tekstProcentu,
     titleSimilarity,
     stemToken,
     knowledgeSummary
@@ -1653,12 +2086,21 @@
       changed = true;
     }
 
-    if ((updated.title || updated.detectedTitle)
-      && (updated.classifierVersion !== CLASSIFIER_VERSION || updated.classification?.version !== CLASSIFIER_VERSION)) {
+    const maTytul = Boolean(updated.title || updated.detectedTitle);
+    const wymagaPelnejKlasyfikacji = maTytul
+      && (updated.classifierVersion !== CLASSIFIER_VERSION || updated.classification?.version !== CLASSIFIER_VERSION);
+    if (wymagaPelnejKlasyfikacji) {
       const title = updated.manualTitle || updated.title || updated.detectedTitle || '';
       updated.title = title;
-      updated.classification = classify(title, updated.ocrText || '');
+      updated.classification = classify(title, updated.ocrText || '', { pominId: id });
       updated.classifierVersion = CLASSIFIER_VERSION;
+      updated.klasyfikacjaUtworzonaAt = Date.now();
+      changed = true;
+    } else if (maTytul && updated.classification
+      && Number(updated.classification.historiaZatwierdzonaAt || updated.klasyfikacjaUtworzonaAt || 0) < najnowszeZatwierdzenieKategoriiAt) {
+      const title = updated.manualTitle || updated.title || updated.detectedTitle || '';
+      updated.classification = classify(title, updated.ocrText || '', { pominId: id });
+      updated.klasyfikacjaUtworzonaAt = Date.now();
       changed = true;
     }
 
@@ -1704,16 +2146,21 @@
     const ocr = await requestOcr(imageUrl, id, onProgress);
     const titleResult = extractTitle(ocr.text, ocr.confidence);
     const issueDateResult = extractIssueDate(ocr.text);
-    const classification = classify(titleResult.title, ocr.text);
+    const classification = classify(titleResult.title, ocr.text, { pominId: id });
     const previous = (await getRecord(id)) || {};
     const preserveManualIssueDate = previous.issueDateSource === 'manual' || previous.issueDateState === 'none';
-    const record = {
+    let record = {
       ...previous,
       imageUrl,
       ocrText: ocr.text,
       ocrConfidence: ocr.confidence,
       ocrVariant: ocr.variant,
       ocrAttempts: ocr.attempts,
+      ocrZakonczonyAt: Date.now(),
+      bladOcr: '',
+      bladOcrAt: 0,
+      bladAutoakceptacji: '',
+      bladAutoakceptacjiAt: 0,
       detectedTitle: titleResult.title,
       title: previous.manualTitle || titleResult.title,
       titleConfidence: titleResult.confidence,
@@ -1726,10 +2173,38 @@
       issueDateRaw: preserveManualIssueDate ? (previous.issueDateRaw || '') : (issueDateResult?.raw || ''),
       issueDateCandidates: issueDateResult?.candidates || [],
       classification,
-      classifierVersion: CLASSIFIER_VERSION
+      classifierVersion: CLASSIFIER_VERSION,
+      klasyfikacjaUtworzonaAt: Date.now()
     };
     await saveRecord(id, record);
+    try {
+      record = await sprobujAutomatycznieZatwierdzicKategorie(id, record);
+    } catch (error) {
+      record = {
+        ...record,
+        bladAutoakceptacji: String(error?.message || error),
+        bladAutoakceptacjiAt: Date.now()
+      };
+      try {
+        await saveRecord(id, record);
+      } catch (bladZapisuStanu) {
+        console.warn('[SEMPER OCR] Nie udało się zapisać lokalnego błędu auto-akceptacji.', bladZapisuStanu);
+      }
+      console.warn('[SEMPER OCR] Automatyczne zatwierdzenie kategorii nie powiodło się.', error);
+    }
     return record;
+  }
+
+  async function zapiszBladOcr(id, blad, rekordZapasowy = null) {
+    const komunikat = String(blad?.message || blad || 'Nieznany błąd OCR');
+    const rekord = {
+      ...((id ? await getRecord(id) : null) || rekordZapasowy || {}),
+      bladOcr: komunikat,
+      bladOcrAt: Date.now()
+    };
+    if (id) await saveRecord(id, rekord);
+    announceRecordUpdate(id, rekord);
+    return rekord;
   }
 
   async function getAssignedCategories(id, force = false) {
@@ -1826,6 +2301,143 @@
       throw new Error('Serwer odpowiedział, ale zapisanych kategorii nie udało się potwierdzić. Otwórz ref_kat.php i sprawdź zapis ręcznie.');
     }
     return verified;
+  }
+
+  async function utrwalPotwierdzoneKategorie(identyfikatorReferencji, zweryfikowane, rekordZapasowy = null, opcje = {}) {
+    const biezacyRekord = await getRecord(identyfikatorReferencji) || rekordZapasowy || {};
+    const zrodloZatwierdzenia = opcje.zrodloZatwierdzenia === 'automatyczne' ? 'automatyczne' : 'reczne';
+    const zatwierdzoneAt = Date.now();
+    let odswiezony = biezacyRekord;
+    if (biezacyRekord?.title || biezacyRekord?.detectedTitle) {
+      const zatwierdzony = {
+        ...biezacyRekord,
+        approvedCategoryIds: zweryfikowane.ids.map(Number).filter(Boolean),
+        approvedCategoryNames: zweryfikowane.names,
+        approvedCategoriesAt: zatwierdzoneAt,
+        zrodloZatwierdzeniaKategorii: zrodloZatwierdzenia,
+        zatwierdzoneKategorieAutomatycznieAt: zrodloZatwierdzenia === 'automatyczne' ? zatwierdzoneAt : 0,
+        sladAutoakceptacji: zrodloZatwierdzenia === 'automatyczne'
+          ? {
+              zatwierdzoneAt,
+              wersjaKlasyfikatora: biezacyRekord.classification?.version || biezacyRekord.classifierVersion || '',
+              pewnoscOcr: opcje.ocena?.pewnoscOcr ?? odczytajProcent(biezacyRekord.ocrConfidence),
+              pewnoscTytulu: opcje.ocena?.pewnoscTytulu ?? odczytajProcent(biezacyRekord.titleConfidence),
+              wynikGlowny: opcje.ocena?.wynikGlowny ?? odczytajProcent(biezacyRekord.classification?.best?.score),
+              wynikDrugiejKategorii: opcje.ocena?.wynikDrugiejKategorii ?? null,
+              przewagaPunktowProcentowych: opcje.ocena?.przewagaPunktowProcentowych ?? null
+            }
+          : null,
+        bladAutoakceptacji: '',
+        bladAutoakceptacjiAt: 0
+      };
+      await saveRecord(identyfikatorReferencji, zatwierdzony);
+      odswiezony = zatwierdzony;
+      try {
+        await loadLearnedExamples();
+        odswiezony = await ensureRecordClassification(identyfikatorReferencji, { ...zatwierdzony, classifierVersion: '' });
+      } catch (error) {
+        console.warn('[SEMPER OCR] Kategorie zapisano, ale nie udało się odświeżyć historii klasyfikatora.', error);
+      }
+    }
+    if (zweryfikowane.ids.length) {
+      try {
+        await markCategoryAssignmentToday(identyfikatorReferencji);
+      } catch (error) {
+        console.warn('[SEMPER OCR] Nie udało się zaktualizować licznika zapisanych kategorii.', error);
+      }
+    }
+    window.dispatchEvent(new CustomEvent('semper-categories-saved', {
+      detail: {
+        id: String(identyfikatorReferencji),
+        ids: zweryfikowane.ids.map(String),
+        names: zweryfikowane.names || [],
+        zrodloZatwierdzenia,
+        record: odswiezony
+      }
+    }));
+    announceRecordUpdate(identyfikatorReferencji, odswiezony);
+    return odswiezony;
+  }
+
+  async function sprobujAutomatycznieZatwierdzicKategorie(identyfikatorReferencji, rekord, zaleznosci = {}) {
+    if (!identyfikatorReferencji) return rekord;
+    const klucz = String(identyfikatorReferencji);
+    if (trwajaceAutoakceptacje.has(klucz)) return trwajaceAutoakceptacje.get(klucz);
+
+    const proba = (async () => {
+      const konfiguracja = zaleznosci.konfiguracja
+        || await (zaleznosci.pobierzKonfiguracje || pobierzKonfiguracjeAutoakceptacji)();
+      const ocenaWstepna = ocenWarunkiAutoakceptacji(rekord, { konfiguracja });
+      if (!ocenaWstepna.mozliwa) return rekord;
+
+      const pobierzPrzypisaneKategorie = zaleznosci.pobierzPrzypisaneKategorie || getAssignedCategories;
+      const przypisaneKategorie = await pobierzPrzypisaneKategorie(identyfikatorReferencji, true);
+      const ocena = ocenWarunkiAutoakceptacji(rekord, { konfiguracja, przypisaneKategorie });
+      if (!ocena.mozliwa) return rekord;
+
+      const zapiszKategorie = zaleznosci.zapiszKategorie || saveCategoriesForReference;
+      const zweryfikowane = await zapiszKategorie(identyfikatorReferencji, ocena.identyfikatoryKategorii);
+      const utrwalKategorie = zaleznosci.utrwalKategorie || utrwalPotwierdzoneKategorie;
+      return utrwalKategorie(identyfikatorReferencji, zweryfikowane, rekord, {
+        zrodloZatwierdzenia: 'automatyczne',
+        ocena
+      });
+    })();
+
+    trwajaceAutoakceptacje.set(klucz, proba);
+    try {
+      return await proba;
+    } finally {
+      trwajaceAutoakceptacje.delete(klucz);
+    }
+  }
+
+  function kolejkujPrzypisanieKategorii(zadanie, identyfikatorKategorii, zapisz, poSukcesie, poBledzie, odswiezStan) {
+    const identyfikator = String(identyfikatorKategorii || '');
+    const przypisane = new Set((zadanie?.assigned?.ids || []).map(String));
+    zadanie.oczekujaceKategorie ||= new Set();
+    zadanie.bledyKategorii ||= new Map();
+    if (!identyfikator || przypisane.has(identyfikator) || zadanie.oczekujaceKategorie.has(identyfikator)) {
+      return Promise.resolve(false);
+    }
+
+    zadanie.oczekujaceKategorie.add(identyfikator);
+    zadanie.bledyKategorii.delete(identyfikator);
+    odswiezStan?.();
+
+    const poprzedniZapis = zadanie.kolejkaKategorii || Promise.resolve();
+    const biezacyZapis = poprzedniZapis.catch(() => {}).then(async () => {
+      const aktualniePrzypisane = new Set((zadanie.assigned?.ids || []).map(String));
+      if (aktualniePrzypisane.has(identyfikator)) {
+        zadanie.oczekujaceKategorie.delete(identyfikator);
+        odswiezStan?.();
+        return false;
+      }
+
+      let zweryfikowane;
+      try {
+        const zadaneId = [...new Set([...aktualniePrzypisane, identyfikator])];
+        zweryfikowane = await zapisz(zadanie.id, zadaneId);
+      } catch (bladZapisu) {
+        zadanie.oczekujaceKategorie.delete(identyfikator);
+        zadanie.bledyKategorii.set(identyfikator, String(bladZapisu?.message || bladZapisu));
+        poBledzie?.(bladZapisu);
+        odswiezStan?.();
+        return false;
+      }
+      zadanie.assigned = zweryfikowane;
+      zadanie.oczekujaceKategorie.delete(identyfikator);
+      zadanie.bledyKategorii.delete(identyfikator);
+      try {
+        await poSukcesie?.(zweryfikowane);
+      } catch (bladDzialanPoZapisie) {
+        console.warn('[SEMPER OCR] Kategoria została zapisana, ale nie udało się wykonać wszystkich działań po zapisie.', bladDzialanPoZapisie);
+      }
+      odswiezStan?.();
+      return true;
+    });
+    zadanie.kolejkaKategorii = biezacyZapis.then(() => undefined, () => undefined);
+    return biezacyZapis;
   }
 
   function findRowContainingText(pattern) {
@@ -2304,6 +2916,258 @@
       .map((item) => String(item.id)));
   }
 
+  function wynikiSugestiiKlasyfikacji(klasyfikacja) {
+    const glowna = klasyfikacja?.best;
+    const wynikGlownej = odczytajProcent(glowna?.score);
+    if (!glowna || wynikGlownej === null || wynikGlownej < PROG_KATEGORII_GLOWNEJ) return [];
+
+    const widziane = new Set();
+    return [glowna, ...(Array.isArray(klasyfikacja.additional) ? klasyfikacja.additional : [])]
+      .filter((wynik) => {
+        const procent = odczytajProcent(wynik?.score);
+        if (!wynik?.name || procent === null || procent < 50) return false;
+        const klucz = String(wynik.id ?? wynik.name);
+        if (widziane.has(klucz)) return false;
+        widziane.add(klucz);
+        return true;
+      })
+      .sort((a, b) => odczytajProcent(b.score) - odczytajProcent(a.score) || Number(a.id) - Number(b.id))
+      .slice(0, 4);
+  }
+
+  function obliczPrzewageKlasyfikacji(klasyfikacja) {
+    if (!klasyfikacja) return null;
+    const wynikiGlowne = (Array.isArray(klasyfikacja.results) ? klasyfikacja.results : [])
+      .filter((wynik) => !wynik?.additional && odczytajProcent(wynik?.score) !== null)
+      .sort((a, b) => odczytajProcent(b.score) - odczytajProcent(a.score) || Number(a.id) - Number(b.id));
+    const kandydaci = wynikiGlowne.length >= 2
+      ? wynikiGlowne
+      : [klasyfikacja.top || klasyfikacja.best, klasyfikacja.second]
+        .filter((wynik, indeks, tablica) => wynik
+          && odczytajProcent(wynik.score) !== null
+          && tablica.findIndex((inny) => String(inny?.id ?? inny?.name) === String(wynik.id ?? wynik.name)) === indeks)
+        .sort((a, b) => odczytajProcent(b.score) - odczytajProcent(a.score));
+    if (kandydaci.length < 2) return null;
+
+    const pierwszyWynik = kandydaci[0];
+    const drugiWynik = kandydaci[1];
+    const roznicaPunktowProcentowych = odczytajProcent(pierwszyWynik.score) - odczytajProcent(drugiWynik.score);
+    return {
+      pierwszyWynik,
+      drugiWynik,
+      roznicaPunktowProcentowych,
+      malaPrzewaga: roznicaPunktowProcentowych < PROG_MALEJ_PRZEWAGI_P_P
+    };
+  }
+
+  function normalizujIdKategorii(wartosci) {
+    return new Set((Array.isArray(wartosci) ? wartosci : []).map(String).filter(Boolean));
+  }
+
+  function czyRekordMaSladOcr(rekord) {
+    return Boolean(
+      rekord?.ocrZakonczonyAt
+      || String(rekord?.ocrText || '').trim()
+      || rekord?.ocrVariant
+      || (Array.isArray(rekord?.ocrAttempts) && rekord.ocrAttempts.length)
+      || odczytajProcent(rekord?.ocrConfidence) !== null
+    );
+  }
+
+  function czyRekordMaSladKlasyfikacji(rekord) {
+    const klasyfikacja = rekord?.classification;
+    return Boolean(
+      rekord?.klasyfikacjaUtworzonaAt
+      || (klasyfikacja && typeof klasyfikacja === 'object' && (
+        rekord?.classifierVersion
+        || klasyfikacja.version
+        || klasyfikacja.best
+        || klasyfikacja.top
+        || Array.isArray(klasyfikacja.results)
+      ))
+    );
+  }
+
+  function czyKlasyfikacjaWymagaDecyzji(klasyfikacja) {
+    if (!klasyfikacja) return false;
+    const wynikGlownej = odczytajProcent(klasyfikacja.best?.score);
+    const przewaga = obliczPrzewageKlasyfikacji(klasyfikacja);
+    return !klasyfikacja.best
+      || wynikGlownej === null
+      || wynikGlownej < PROG_KATEGORII_GLOWNEJ
+      || przewaga?.malaPrzewaga
+      || /wymaga.*(?:decyzji|weryfikacji)/i.test(String(klasyfikacja.status || ''));
+  }
+
+  function czyKategorieZostalyZatwierdzone(rekord, przypisaneKategorie) {
+    if (!rekord?.approvedCategoriesAt || !Array.isArray(przypisaneKategorie?.ids)) return false;
+    const przypisane = normalizujIdKategorii(przypisaneKategorie.ids);
+    const zatwierdzone = normalizujIdKategorii(rekord.approvedCategoryIds);
+    return przypisane.size === zatwierdzone.size
+      && [...przypisane].every((identyfikator) => zatwierdzone.has(identyfikator));
+  }
+
+  function utworzStanReferencji(klucz, etykieta, klasa, uzasadnienie, sygnaly) {
+    return { klucz, etykieta, klasa, uzasadnienie, sygnaly };
+  }
+
+  function wyliczStanReferencji({ rekord = null, przypisaneKategorie = null, bladOcr = '', sortowanieLegacy = '' } = {}) {
+    const kategorieWczytane = Array.isArray(przypisaneKategorie?.ids);
+    const maKategorie = kategorieWczytane && przypisaneKategorie.ids.length > 0;
+    const maSladOcr = czyRekordMaSladOcr(rekord);
+    const maSladKlasyfikacji = czyRekordMaSladKlasyfikacji(rekord);
+    const pewnoscOcr = odczytajProcent(rekord?.ocrConfidence);
+    const niskaPewnoscOcr = maSladOcr && pewnoscOcr !== null && pewnoscOcr < 60;
+    const przypisaneId = normalizujIdKategorii(przypisaneKategorie?.ids);
+    const sugerowaneId = String(rekord?.classification?.best?.id || '');
+    const rozbieznoscKategorii = maSladKlasyfikacji && maKategorie && Boolean(sugerowaneId) && !przypisaneId.has(sugerowaneId);
+    const blad = String(bladOcr || rekord?.bladOcr || '').trim();
+    const bladAutoakceptacji = String(rekord?.bladAutoakceptacji || '').trim();
+    const zatwierdzone = czyKategorieZostalyZatwierdzone(rekord, przypisaneKategorie);
+    const zatwierdzoneAutomatycznie = zatwierdzone && rekord?.zrodloZatwierdzeniaKategorii === 'automatyczne';
+    const sygnaly = {
+      kategorieWczytane,
+      maKategorie,
+      maSladOcr,
+      maSladKlasyfikacji,
+      niskaPewnoscOcr,
+      rozbieznoscKategorii,
+      zatwierdzone,
+      zatwierdzoneAutomatycznie,
+      sortowanieLegacy: String(sortowanieLegacy || '').trim()
+    };
+
+    if (blad) {
+      return utworzStanReferencji('blad-ocr', 'Błąd OCR', 'blad', blad, sygnaly);
+    }
+    if (bladAutoakceptacji && !zatwierdzone) {
+      return utworzStanReferencji('wymaga-decyzji', 'Wymaga decyzji', 'wymaga-decyzji', `Automatyczny zapis kategorii nie powiódł się: ${bladAutoakceptacji}`, sygnaly);
+    }
+    if (zatwierdzone) {
+      return zatwierdzoneAutomatycznie
+        ? utworzStanReferencji('auto-zatwierdzona', 'Auto-zatwierdzona', 'auto-zatwierdzona', 'Kategorie zapisano automatycznie po spełnieniu wszystkich konserwatywnych warunków.', sygnaly)
+        : utworzStanReferencji('zweryfikowana', 'Zweryfikowana', 'zweryfikowana', 'Zapisane kategorie są zgodne ze świadomie zatwierdzonym wyborem.', sygnaly);
+    }
+    if (maKategorie && !maSladOcr && !maSladKlasyfikacji) {
+      return utworzStanReferencji('przypisana-bez-ocr', 'Przypisana bez OCR', 'przypisana-bez-ocr', 'Kategorie istnieją, ale brak wiarygodnego śladu OCR lub klasyfikacji wykonanej przez skrypt.', sygnaly);
+    }
+    if (niskaPewnoscOcr) {
+      return utworzStanReferencji('wymaga-decyzji', 'Wymaga decyzji', 'wymaga-decyzji', `Pewność OCR ${pewnoscOcr}% wymaga ręcznej kontroli.`, sygnaly);
+    }
+    if (rozbieznoscKategorii) {
+      return utworzStanReferencji('wymaga-decyzji', 'Wymaga decyzji', 'wymaga-decyzji', 'Główna sugestia klasyfikatora nie występuje w zapisanych kategoriach.', sygnaly);
+    }
+    if (maSladKlasyfikacji) {
+      if (czyKlasyfikacjaWymagaDecyzji(rekord?.classification)) {
+        return utworzStanReferencji('wymaga-decyzji', 'Wymaga decyzji', 'wymaga-decyzji', 'Klasyfikacja nie daje wystarczająco jednoznacznego wyniku.', sygnaly);
+      }
+      return utworzStanReferencji('sklasyfikowana', 'Sklasyfikowana', 'sklasyfikowana', 'Klasyfikator wygenerował wynik, który nie został jeszcze zatwierdzony.', sygnaly);
+    }
+    if (maSladOcr) {
+      return utworzStanReferencji('ocr-gotowy', 'OCR gotowy', 'ocr-gotowy', 'OCR zakończył się poprawnie, ale brak końcowej klasyfikacji.', sygnaly);
+    }
+    if (!kategorieWczytane) {
+      return utworzStanReferencji('sprawdzanie', 'Sprawdzanie…', 'sprawdzanie', 'Trwa ustalanie przypisanych kategorii.', sygnaly);
+    }
+    return utworzStanReferencji('nieprzypisana', 'Nieprzypisana', 'nieprzypisana', 'Brak kategorii i brak zakończonego procesu dającego gotowy wynik.', sygnaly);
+  }
+
+  function utworzWskaznikPrzewagi(klasyfikacja) {
+    const przewaga = obliczPrzewageKlasyfikacji(klasyfikacja);
+    if (!przewaga) return null;
+    const wskaznik = document.createElement('span');
+    wskaznik.className = `semper-wskaznik-przewagi${przewaga.malaPrzewaga ? ' mala' : ''}`;
+    const tekstPrzewagi = `TOP1–TOP2: +${przewaga.roznicaPunktowProcentowych} p.p.`;
+    wskaznik.textContent = przewaga.malaPrzewaga ? `⚠ ${tekstPrzewagi}` : tekstPrzewagi;
+    wskaznik.title = `${przewaga.malaPrzewaga ? 'Mała przewaga TOP1. ' : ''}${przewaga.pierwszyWynik.name}: ${tekstProcentu(przewaga.pierwszyWynik.score)}; ${przewaga.drugiWynik.name}: ${tekstProcentu(przewaga.drugiWynik.score)}.`;
+    return wskaznik;
+  }
+
+  function skrocFragmentUzasadnienia(wartosc, limit = 64) {
+    const tekst = String(wartosc || '').replace(/\s+/g, ' ').trim();
+    return tekst.length > limit ? `${tekst.slice(0, limit - 1).trimEnd()}…` : tekst;
+  }
+
+  function uzasadnienieWynikuKlasyfikacji(wynik) {
+    if (!wynik) return '';
+    const trafienia = [...new Set((Array.isArray(wynik.hits) ? wynik.hits : [])
+      .map((trafienie) => skrocFragmentUzasadnienia(trafienie))
+      .filter(Boolean))]
+      .slice(0, 4);
+    const evidence = wynik.evidence || {};
+    const sygnaly = [
+      ['pojęcia dziedzinowe', evidence.domain],
+      ['podobieństwo do oferty SEMPER', evidence.public],
+      ['podobieństwo do zatwierdzonych referencji', evidence.user],
+      ['profil językowy tytułu', evidence.lexical]
+    ]
+      .map(([nazwa, wartosc]) => ({ nazwa, wynik: odczytajProcent(wartosc) }))
+      .filter((sygnal) => sygnal.wynik !== null && sygnal.wynik > 0)
+      .sort((a, b) => b.wynik - a.wynik)
+      .slice(0, 2);
+    const czesci = [];
+    if (trafienia.length) czesci.push(`Trafione pojęcia: ${trafienia.map((trafienie) => `„${trafienie}”`).join(', ')}`);
+    if (sygnaly.length) czesci.push(`Najsilniejsze sygnały: ${sygnaly.map((sygnal) => `${sygnal.nazwa} ${sygnal.wynik}%`).join(', ')}`);
+    return czesci.join('. ');
+  }
+
+  function pobierzTooltipUzasadnienia() {
+    let tooltip = document.getElementById(ID_TOOLTIPU_UZASADNIENIA);
+    if (tooltip) return tooltip;
+    tooltip = document.createElement('div');
+    tooltip.id = ID_TOOLTIPU_UZASADNIENIA;
+    tooltip.className = 'semper-tooltip-uzasadnienia';
+    tooltip.setAttribute('role', 'tooltip');
+    tooltip.hidden = true;
+    document.body.appendChild(tooltip);
+    window.addEventListener('scroll', () => ukryjTooltipUzasadnienia(), true);
+    window.addEventListener('resize', () => ukryjTooltipUzasadnienia());
+    return tooltip;
+  }
+
+  function pokazTooltipUzasadnienia(element) {
+    const tooltip = pobierzTooltipUzasadnienia();
+    const tresc = element?.dataset?.uzasadnienieKlasyfikacji || 'Brak zapisanego uzasadnienia dla tej kategorii.';
+    tooltip.textContent = tresc;
+    tooltip.hidden = false;
+    tooltip.dataset.cel = element?.dataset?.identyfikatorTooltipu || '';
+    const prostokat = element.getBoundingClientRect();
+    const margines = 8;
+    const odstep = 5;
+    const szerokosc = tooltip.offsetWidth;
+    const wysokosc = tooltip.offsetHeight;
+    const lewo = Math.min(Math.max(margines, prostokat.left), Math.max(margines, window.innerWidth - szerokosc - margines));
+    const dol = prostokat.bottom + odstep;
+    const gora = prostokat.top - wysokosc - odstep;
+    const top = dol + wysokosc <= window.innerHeight - margines ? dol : Math.max(margines, gora);
+    tooltip.style.left = `${Math.round(lewo)}px`;
+    tooltip.style.top = `${Math.round(top)}px`;
+  }
+
+  function ukryjTooltipUzasadnienia(element = null) {
+    const tooltip = document.getElementById(ID_TOOLTIPU_UZASADNIENIA);
+    if (!tooltip || tooltip.hidden) return;
+    if (element && tooltip.dataset.cel !== element.dataset.identyfikatorTooltipu) return;
+    tooltip.hidden = true;
+    tooltip.dataset.cel = '';
+  }
+
+  function podepnijTooltipUzasadnienia(element, wynik) {
+    const uzasadnienie = uzasadnienieWynikuKlasyfikacji(wynik);
+    pobierzTooltipUzasadnienia();
+    element.dataset.uzasadnienieKlasyfikacji = uzasadnienie;
+    element.dataset.identyfikatorTooltipu = `${wynik?.id ?? wynik?.name ?? 'brak'}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    element.setAttribute('aria-describedby', ID_TOOLTIPU_UZASADNIENIA);
+    element.addEventListener('mouseenter', () => pokazTooltipUzasadnienia(element));
+    element.addEventListener('mouseleave', () => ukryjTooltipUzasadnienia(element));
+    element.addEventListener('focus', () => pokazTooltipUzasadnienia(element));
+    element.addEventListener('blur', () => ukryjTooltipUzasadnienia(element));
+    element.addEventListener('keydown', (zdarzenie) => {
+      if (zdarzenie.key === 'Escape') ukryjTooltipUzasadnienia(element);
+    });
+    element.addEventListener('click', () => ukryjTooltipUzasadnienia(element));
+  }
+
   function updateInlineCategorySuggestions(section, record) {
     if (!section) return;
     const suggested = categorySuggestionIds(record);
@@ -2329,10 +3193,10 @@
 
     const hint = section.querySelector('[data-role="category-suggestion-hint"]');
     if (hint) {
-      const best = record?.classification?.best;
-      hint.textContent = best
-        ? `Sugestia OCR: ${best.name} (${best.score}/100, pewność ${record.classification.level}). Możesz zastosować ją jednym kliknięciem lub zaznaczyć kategorie ręcznie.`
-        : 'Brak mocnej sugestii OCR. Kategorie możesz zaznaczyć ręcznie.';
+      const wyniki = wynikiSugestiiKlasyfikacji(record?.classification);
+      hint.textContent = wyniki.length
+        ? `Sugestie klasyfikacji: ${wyniki.map((wynik) => `${wynik.name} — ${tekstProcentu(wynik.score)}`).join(', ')}. Możesz zastosować je jednym kliknięciem lub zaznaczyć kategorie ręcznie.`
+        : 'Brak mocnej sugestii klasyfikacji. Kategorie możesz zaznaczyć ręcznie.';
     }
   }
 
@@ -2394,8 +3258,15 @@
         status.textContent = 'Niezapisane zmiany';
       } else {
         const selectedCount = optionSnapshot.filter((option) => option.selected).length;
+        const zatwierdzoneAutomatycznie = selectedCount
+          && record?.zrodloZatwierdzeniaKategorii === 'automatyczne'
+          && czyKategorieZostalyZatwierdzone(record, {
+            ids: optionSnapshot.filter((option) => option.selected).map((option) => option.id)
+          });
         status.className = `semper-inline-category-status${selectedCount ? ' success' : ''}`;
-        status.textContent = selectedCount ? `Zapisane: ${selectedCount}` : 'Brak zapisanych kategorii';
+        status.textContent = selectedCount
+          ? `${zatwierdzoneAutomatycznie ? 'Auto-zatwierdzone' : 'Zapisane'}: ${selectedCount}`
+          : 'Brak zapisanych kategorii';
       }
       return dirty;
     }
@@ -2420,8 +3291,15 @@
         record = await getRecord(id);
         updateInlineCategorySuggestions(section, record);
         const selectedCount = optionSnapshot.filter((option) => option.selected).length;
+        const zatwierdzoneAutomatycznie = selectedCount
+          && record?.zrodloZatwierdzeniaKategorii === 'automatyczne'
+          && czyKategorieZostalyZatwierdzone(record, {
+            ids: optionSnapshot.filter((option) => option.selected).map((option) => option.id)
+          });
         status.className = `semper-inline-category-status${selectedCount ? ' success' : ''}`;
-        status.textContent = selectedCount ? `Zapisane: ${selectedCount}` : 'Brak zapisanych kategorii';
+        status.textContent = selectedCount
+          ? `${zatwierdzoneAutomatycznie ? 'Auto-zatwierdzone' : 'Zapisane'}: ${selectedCount}`
+          : 'Brak zapisanych kategorii';
         setDirty(categoryDirtyKey, false);
         if (force) await chrome.storage.local.remove(categoryCacheKey(id));
       } catch (error) {
@@ -2455,26 +3333,9 @@
         status.className = 'semper-inline-category-status success';
         status.textContent = verified.names.length ? `Zapisano: ${verified.names.length} kategorii` : 'Zapisano brak kategorii.';
         optionSnapshot = optionSnapshot.map((option) => ({ ...option, selected: verified.ids.includes(option.id) }));
-        if (verified.ids.length) await markCategoryAssignmentToday(id);
-        window.dispatchEvent(new CustomEvent('semper-categories-saved', {
-          detail: { id: String(id), ids: verified.ids.map(String), names: verified.names || [] }
-        }));
         // Jawny zapis użytkownika staje się przykładem uczącym klasyfikator.
-        const currentRecord = await getRecord(id);
-        if (currentRecord?.title || currentRecord?.detectedTitle) {
-          const approved = {
-            ...currentRecord,
-            approvedCategoryIds: verified.ids.map(Number).filter(Boolean),
-            approvedCategoryNames: verified.names,
-            approvedCategoriesAt: Date.now()
-          };
-          await saveRecord(id, approved);
-          await loadLearnedExamples();
-          const refreshed = await ensureRecordClassification(id, { ...approved, classifierVersion: '' });
-          record = refreshed;
-          updateInlineCategorySuggestions(section, refreshed);
-          announceRecordUpdate(id, refreshed);
-        }
+        record = await utrwalPotwierdzoneKategorie(id, verified, record);
+        updateInlineCategorySuggestions(section, record);
         setDirty(categoryDirtyKey, false);
       } catch (error) {
         status.className = 'semper-inline-category-status error';
@@ -2498,6 +3359,7 @@
 
     window.addEventListener('semper-categories-saved', (event) => {
       if (String(event.detail?.id || '') !== String(id)) return;
+      record = event.detail?.record || record;
       const savedIds = new Set((event.detail?.ids || []).map(String));
       optionSnapshot = optionSnapshot.map((option) => ({ ...option, selected: savedIds.has(String(option.id)) }));
       section.querySelectorAll('input[type="checkbox"]').forEach((input) => {
@@ -2505,7 +3367,9 @@
       });
       const selectedCount = optionSnapshot.filter((option) => option.selected).length;
       status.className = `semper-inline-category-status${selectedCount ? ' success' : ''}`;
-      status.textContent = selectedCount ? `Zapisane: ${selectedCount}` : 'Brak zapisanych kategorii';
+      status.textContent = selectedCount
+        ? `${event.detail?.zrodloZatwierdzenia === 'automatyczne' ? 'Auto-zatwierdzone' : 'Zapisane'}: ${selectedCount}`
+        : 'Brak zapisanych kategorii';
       setDirty(categoryDirtyKey, false);
     });
 
@@ -2517,11 +3381,24 @@
     window.dispatchEvent(new CustomEvent('semper-ocr-record-updated', { detail: { id: String(id), record } }));
   }
 
-  function statusClass(confidence) {
-    if (confidence >= 80) return 'semper-ref-status-good';
-    if (confidence >= 55) return 'semper-ref-status-mid';
-    if (confidence > 0) return 'semper-ref-status-bad';
-    return 'semper-ref-status-wait';
+  function odczytajProcent(wartosc) {
+    if (wartosc === null || wartosc === undefined || wartosc === '') return null;
+    const procent = Number(wartosc);
+    if (!Number.isFinite(procent) || procent < 0 || procent > 100) return null;
+    return Math.round(procent);
+  }
+
+  function tekstProcentu(wartosc) {
+    const procent = odczytajProcent(wartosc);
+    return procent === null ? '—' : `${procent}%`;
+  }
+
+  function klasaStanuProcentu(wartosc) {
+    const procent = odczytajProcent(wartosc);
+    if (procent === null) return 'semper-ref-status-wait';
+    if (procent >= 80) return 'semper-ref-status-good';
+    if (procent >= 55) return 'semper-ref-status-mid';
+    return 'semper-ref-status-bad';
   }
 
   function renderPills(cell, values, empty = 'Brak') {
@@ -2534,6 +3411,7 @@
       const span = document.createElement('span');
       span.className = 'semper-ref-pill';
       span.textContent = value;
+      span.title = value;
       cell.appendChild(span);
     }
   }
@@ -2565,15 +3443,20 @@
       return;
     }
     const div = document.createElement('div');
+    div.className = 'semper-ref-tytul';
     div.textContent = title;
+    div.title = title;
+    div.tabIndex = 0;
     cell.appendChild(div);
     const meta = document.createElement('div');
-    meta.className = statusClass(record?.titleConfidence || 0);
-    meta.style.marginTop = '3px';
-    meta.style.fontSize = '11px';
-    meta.textContent = `tytuł: ${record?.titleConfidence || 0}%`;
+    const pewnoscWykryciaTytulu = odczytajProcent(record?.titleConfidence);
+    meta.className = `semper-ref-title-meta ${klasaStanuProcentu(pewnoscWykryciaTytulu)}`;
+    meta.textContent = `Wykrycie tytułu: ${tekstProcentu(pewnoscWykryciaTytulu)}`;
+    meta.title = 'Pewność automatycznego wykrycia tytułu, niezależna od wyniku klasyfikacji kategorii.';
     cell.appendChild(meta);
     cell.appendChild(utworzOznaczenieWeryfikacji(czyTytulZatwierdzonyRecznie(record), 'Tytuł'));
+    const znacznikZnaneSzkolenie = utworzZnacznikZnaneSzkolenie(record?.classification?.znaneSzkolenie);
+    if (znacznikZnaneSzkolenie) cell.appendChild(znacznikZnaneSzkolenie);
   }
 
   function setIssueDateCell(cell, record) {
@@ -2593,38 +3476,133 @@
     }
     const value = document.createElement('div');
     value.textContent = formatIssueDate(record.issueDate) || record.issueDate;
-    value.className = record.issueDateSource === 'manual' ? 'semper-ref-status-good' : statusClass(record.issueDateConfidence || 0);
+    value.className = record.issueDateSource === 'manual' ? 'semper-ref-status-good' : klasaStanuProcentu(record.issueDateConfidence);
     cell.appendChild(value);
     if (record.issueDateSource === 'auto') {
       const meta = document.createElement('div');
       meta.className = 'semper-ref-date-meta';
-      meta.textContent = `${record.issueDateConfidence || 0}%`;
+      meta.textContent = `Wykrycie daty: ${tekstProcentu(record.issueDateConfidence)}`;
       cell.appendChild(meta);
     }
     cell.appendChild(utworzOznaczenieWeryfikacji(czyDataZatwierdzonaRecznie(record), 'Data wystawienia'));
   }
 
-  function setSuggestionCell(cell, record) {
+  function ustawKomorkeSugestii(zadanie) {
+    const cell = zadanie.suggestionCell;
+    const record = zadanie.record;
+    ukryjTooltipUzasadnienia();
     cell.textContent = '';
-    const c = record?.classification;
-    if (!c?.best) {
-      cell.innerHTML = '<span class="semper-ref-status-wait">Brak sugestii</span>';
+    const klasyfikacja = record?.classification;
+    const wyniki = wynikiSugestiiKlasyfikacji(klasyfikacja);
+    if (!klasyfikacja) {
+      cell.innerHTML = '<span class="semper-ref-status-wait">Klasyfikacja: —</span>';
       return;
     }
-    const main = document.createElement('div');
-    main.textContent = c.best.name;
-    main.className = c.level === 'wysoka' ? 'semper-ref-status-good' : c.level === 'średnia' ? 'semper-ref-status-mid' : 'semper-ref-status-bad';
-    cell.appendChild(main);
-    const meta = document.createElement('div');
-    meta.style.fontSize = '11px';
-    meta.textContent = `${c.best.score}/100 · pewność ${c.level}`;
-    cell.appendChild(meta);
+    const wskaznikPrzewagi = utworzWskaznikPrzewagi(klasyfikacja);
+    if (wskaznikPrzewagi) cell.appendChild(wskaznikPrzewagi);
+    if (!wyniki.length) {
+      const brakSugestii = document.createElement('span');
+      brakSugestii.className = 'semper-ref-status-wait';
+      brakSugestii.textContent = 'Brak sugestii';
+      cell.appendChild(brakSugestii);
+      const najwyzszyWynik = klasyfikacja.top;
+      const procentNajwyzszegoWyniku = odczytajProcent(najwyzszyWynik?.score);
+      if (najwyzszyWynik?.name && procentNajwyzszegoWyniku !== null) {
+        const pozycja = document.createElement('div');
+        pozycja.className = 'semper-ref-wynik-klasyfikacji';
+        pozycja.textContent = `${najwyzszyWynik.name} — ${tekstProcentu(procentNajwyzszegoWyniku)}`;
+        pozycja.title = 'Najwyższy wynik klasyfikacji jest poniżej progu automatycznej sugestii.';
+        cell.appendChild(pozycja);
+      }
+      return;
+    }
+    const idGlownej = String(klasyfikacja.best.id ?? klasyfikacja.best.name);
+    const przypisane = new Set((zadanie.assigned?.ids || []).map(String));
+    const kategorieWczytane = Boolean(zadanie.assigned);
+    for (const wynik of wyniki) {
+      const pozycja = document.createElement('button');
+      pozycja.type = 'button';
+      const identyfikator = String(wynik.id ?? '');
+      const czyGlowna = String(wynik.id ?? wynik.name) === idGlownej;
+      const czyPrzypisana = przypisane.has(identyfikator);
+      const czyZapisywana = zadanie.oczekujaceKategorie?.has(identyfikator);
+      const blad = zadanie.bledyKategorii?.get(identyfikator) || '';
+      pozycja.className = `semper-ref-sugestia-przycisk ${czyGlowna ? 'semper-ref-sugestia-glowna' : 'semper-ref-sugestia-dodatkowa'}`;
+      pozycja.classList.toggle('przypisana', czyPrzypisana);
+      pozycja.classList.toggle('zapisywanie', czyZapisywana);
+      pozycja.classList.toggle('blad', Boolean(blad));
+      pozycja.classList.toggle('wczytywanie', !kategorieWczytane);
+      pozycja.textContent = `${wynik.name} — ${tekstProcentu(wynik.score)}`;
+      pozycja.disabled = !kategorieWczytane || czyPrzypisana || czyZapisywana;
+      pozycja.setAttribute('aria-pressed', czyPrzypisana ? 'true' : 'false');
+      pozycja.setAttribute('aria-label', czyPrzypisana
+        ? `${wynik.name}, przypisana`
+        : czyZapisywana
+          ? `${wynik.name}, zapisywanie`
+          : blad
+            ? `${wynik.name}, błąd zapisu, kliknij, aby spróbować ponownie`
+            : `${wynik.name}, przypisz kategorię`);
+      podepnijTooltipUzasadnienia(pozycja, wynik);
+      pozycja.addEventListener('click', () => przypiszSugerowanaKategorie(zadanie, wynik));
+      cell.appendChild(pozycja);
+    }
+
+    const komunikat = document.createElement('span');
+    komunikat.className = 'semper-ref-sugestia-komunikat';
+    komunikat.setAttribute('aria-live', 'polite');
+    komunikat.textContent = zadanie.komunikatSugestii || '';
+    cell.appendChild(komunikat);
+  }
+
+  function przypiszSugerowanaKategorie(zadanie, wynik) {
+    if (!zadanie.assigned) return Promise.resolve(false);
+    zadanie.komunikatSugestii = `Zapisywanie kategorii: ${wynik.name}.`;
+    return kolejkujPrzypisanieKategorii(
+      zadanie,
+      wynik.id,
+      saveCategoriesForReference,
+      async (zweryfikowane) => {
+        renderPills(zadanie.categoryCell, zweryfikowane.names, 'Nieprzypisane');
+        ustawKolorPrzypisanejReferencji(zadanie);
+        zadanie.komunikatSugestii = `Przypisano kategorię: ${wynik.name}.`;
+        ustawKomorkeSugestii(zadanie);
+        zadanie.record = await utrwalPotwierdzoneKategorie(zadanie.id, zweryfikowane, zadanie.record);
+      },
+      (bladZapisu) => {
+        zadanie.komunikatSugestii = `Nie udało się przypisać kategorii ${wynik.name}: ${bladZapisu?.message || bladZapisu}.`;
+      },
+      () => {
+        ustawKomorkeSugestii(zadanie);
+        ustawKomorkeStanu(zadanie);
+      }
+    );
+  }
+
+  function ustawKomorkeStanu(zadanie) {
+    const komorka = zadanie?.statusCell;
+    if (!komorka) return null;
+    const stan = wyliczStanReferencji({
+      rekord: zadanie.record,
+      przypisaneKategorie: zadanie.assigned,
+      bladOcr: zadanie.bladOcr,
+      sortowanieLegacy: zadanie.sortowanieLegacy
+    });
+    zadanie.stan = stan;
+    komorka.textContent = '';
+    komorka.classList.add('semper-ref-stan-komorka');
+    komorka.dataset.stanReferencji = stan.klucz;
+    komorka.title = stan.uzasadnienie;
+    const znacznik = document.createElement('span');
+    znacznik.className = `semper-ref-znacznik-stanu ${stan.klasa}`;
+    znacznik.textContent = stan.etykieta;
+    komorka.appendChild(znacznik);
+    return stan;
   }
 
   function setOcrCell(cell, record) {
-    const confidence = record?.ocrConfidence || 0;
-    cell.className = `semper-ref-ocr-cell ${statusClass(confidence)}`;
-    cell.textContent = confidence ? `${confidence}%` : '—';
+    const pewnoscOcr = odczytajProcent(record?.ocrConfidence);
+    cell.className = `semper-ref-ocr-cell ${klasaStanuProcentu(pewnoscOcr)}`;
+    cell.textContent = `OCR: ${tekstProcentu(pewnoscOcr)}`;
     if (record?.ocrVariant) cell.title = `Wariant: ${record.ocrVariant}`;
   }
 
@@ -3131,14 +4109,17 @@
       for (const job of jobs) {
         const rec = job.record || null;
         const assigned = job.assigned || { ids: [] };
+        const stan = job.stan || wyliczStanReferencji({
+          rekord: rec,
+          przypisaneKategorie: job.assigned,
+          bladOcr: job.bladOcr,
+          sortowanieLegacy: job.sortowanieLegacy
+        });
         let show = true;
-        if (filter.value === 'unanalyzed') show = !rec?.ocrText;
-        if (filter.value === 'verify') show = rec?.classification?.level === 'niska' || (rec?.ocrConfidence > 0 && rec.ocrConfidence < 60);
+        if (filter.value === 'unanalyzed') show = ['nieprzypisana', 'przypisana-bez-ocr'].includes(stan.klucz);
+        if (filter.value === 'verify') show = ['wymaga-decyzji', 'blad-ocr'].includes(stan.klucz);
         if (filter.value === 'nocat') show = !assigned.ids?.length;
-        if (filter.value === 'conflict') {
-          const suggested = String(rec?.classification?.best?.id || '');
-          show = Boolean(suggested && assigned.ids?.length && !assigned.ids.includes(suggested));
-        }
+        if (filter.value === 'conflict') show = stan.sygnaly.rozbieznoscKategorii;
         job.row.style.display = show ? '' : 'none';
       }
       const visible = jobs.filter((job) => job.row.style.display !== 'none').length;
@@ -3169,15 +4150,21 @@
           if (job.record) job.record = await ensureRecordClassification(job.id, job.record);
           setTitleCell(job.titleCell, job.record);
           setIssueDateCell(job.issueDateCell, job.record);
-          setSuggestionCell(job.suggestionCell, job.record);
+          ustawKomorkeSugestii(job);
           setOcrCell(job.ocrCell, job.record);
+          ustawKomorkeStanu(job);
           try {
             job.assigned = await getAssignedCategories(job.id, true);
             renderPills(job.categoryCell, job.assigned.names, 'Nieprzypisane');
             ustawKolorPrzypisanejReferencji(job);
+            ustawKomorkeSugestii(job);
+            ustawKomorkeStanu(job);
           } catch (error) {
+            job.assigned = null;
             job.categoryCell.textContent = 'Błąd odczytu';
             job.categoryCell.title = String(error?.message || error);
+            ustawKomorkeSugestii(job);
+            ustawKomorkeStanu(job);
           }
         });
         status.textContent = `Odświeżono ${jobs.length} referencji.`;
@@ -3214,16 +4201,30 @@
             job.record = record;
             ocrRun += 1;
           }
+          if (job.record?.zrodloZatwierdzeniaKategorii === 'automatyczne' && job.record?.approvedCategoriesAt) {
+            try {
+              job.assigned = await getAssignedCategories(job.id);
+              renderPills(job.categoryCell, job.assigned.names, 'Nieprzypisane');
+              ustawKolorPrzypisanejReferencji(job);
+            } catch (error) {
+              console.warn('[SEMPER OCR] Auto-zatwierdzenie zapisano, ale nie udało się odświeżyć komórki kategorii.', error);
+            }
+          }
           setTitleCell(job.titleCell, job.record);
           setIssueDateCell(job.issueDateCell, job.record);
-          setSuggestionCell(job.suggestionCell, job.record);
+          ustawKomorkeSugestii(job);
           setOcrCell(job.ocrCell, job.record);
+          job.bladOcr = '';
+          ustawKomorkeStanu(job);
         } catch (error) {
           errors += 1;
+          job.bladOcr = String(error?.message || error);
+          job.record = await zapiszBladOcr(job.id, error, job.record);
           job.ocrCell.className = 'semper-ref-ocr-cell semper-ref-status-bad';
           const errorMessage = String(error?.message || error);
           job.ocrCell.textContent = /pliku graficznego|obrazu referencji/i.test(errorMessage) ? 'Brak obrazu' : 'Błąd';
           job.ocrCell.title = errorMessage;
+          ustawKomorkeStanu(job);
           console.error('[SEMPER OCR] Błąd analizy ID', job.id, error);
         } finally {
           job.row.classList.remove('semper-ref-row-processing');
@@ -3275,7 +4276,11 @@
     const liczbaKolumnOpcji = Math.max(1, Number(naglowekOpcji?.colSpan) || 1);
     if (nameVisualIndex < 0) return false;
     nameHeader.classList.add('semper-ref-name-header');
-    if (naglowekSortowania) naglowekSortowania.classList.add('semper-ref-sort-header');
+    if (naglowekSortowania) {
+      naglowekSortowania.classList.add('semper-ref-sort-header', 'semper-ref-stan-naglowek');
+      naglowekSortowania.textContent = 'Status';
+      naglowekSortowania.title = 'Stan procesu referencji. Techniczne Sortowanie pozostaje zachowane w danych Wavepanelu.';
+    }
     if (naglowekOpcji) {
       naglowekOpcji.colSpan = 1;
       naglowekOpcji.textContent = 'Flagi';
@@ -3299,15 +4304,23 @@
     issueDateHeader.textContent = 'Data wystawienia';
     insertAfter(titleHeader, issueDateHeader);
 
+    let dodatkowyNaglowekStanu = null;
+    if (!naglowekSortowania) {
+      dodatkowyNaglowekStanu = document.createElement('th');
+      dodatkowyNaglowekStanu.className = 'semper-ref-stan-naglowek';
+      dodatkowyNaglowekStanu.textContent = 'Status';
+      header.appendChild(dodatkowyNaglowekStanu);
+    }
+
     const catHeader = document.createElement('th');
     catHeader.className = 'semper-ref-category-header';
     catHeader.textContent = 'Kategorie';
     const suggestionHeader = document.createElement('th');
     suggestionHeader.className = 'semper-ref-suggestion-header';
-    suggestionHeader.textContent = 'Sugestia';
+    suggestionHeader.textContent = 'Sugestia klasyfikacji';
     const ocrHeader = document.createElement('th');
     ocrHeader.className = 'semper-ref-ocr-header';
-    ocrHeader.textContent = 'OCR';
+    ocrHeader.textContent = 'Pewność OCR';
     header.append(catHeader, suggestionHeader, ocrHeader);
 
     const rows = getDataRows(table, header);
@@ -3317,8 +4330,23 @@
       const nameCell = findCellAtVisualColumn(row, nameVisualIndex);
       if (!nameCell) continue;
       findCellAtVisualColumn(row, indeksOpcji)?.classList.add('semper-ref-flagi-komorka');
-      findCellAtVisualColumn(row, indeksSortowania)?.classList.add('semper-ref-sort-cell');
+      let statusCell = findCellAtVisualColumn(row, indeksSortowania);
+      const sortowanieLegacy = String(statusCell?.textContent || '').trim();
+      if (!statusCell && dodatkowyNaglowekStanu) {
+        statusCell = document.createElement('td');
+        row.appendChild(statusCell);
+      }
+      statusCell?.classList.add('semper-ref-sort-cell', 'semper-ref-stan-komorka');
       nameCell.classList.add('semper-ref-name-cell');
+      const nazwaInstytucji = String(nameCell.textContent || '').replace(/\s+/g, ' ').trim();
+      if (nazwaInstytucji) {
+        const instytucja = document.createElement('div');
+        instytucja.className = 'semper-ref-instytucja';
+        instytucja.title = nazwaInstytucji;
+        instytucja.tabIndex = 0;
+        while (nameCell.firstChild) instytucja.appendChild(nameCell.firstChild);
+        nameCell.appendChild(instytucja);
+      }
       przywrocPrzyciskiOpcjiWWierszu(row, indeksOpcji, liczbaKolumnOpcji);
 
       const titleCell = document.createElement('td');
@@ -3343,7 +4371,27 @@
       row.append(categoryCell, suggestionCell, ocrCell);
 
       const editUrl = findReferenceEditUrlInRow(row, id);
-      jobs.push({ id, row, editUrl, titleCell, issueDateCell, categoryCell, suggestionCell, ocrCell, record: null, assigned: null });
+      const zadanie = {
+        id,
+        row,
+        editUrl,
+        statusCell,
+        sortowanieLegacy,
+        titleCell,
+        issueDateCell,
+        categoryCell,
+        suggestionCell,
+        ocrCell,
+        record: null,
+        assigned: null,
+        oczekujaceKategorie: new Set(),
+        bledyKategorii: new Map(),
+        kolejkaKategorii: Promise.resolve(),
+        komunikatSugestii: '',
+        bladOcr: ''
+      };
+      jobs.push(zadanie);
+      ustawKomorkeStanu(zadanie);
     }
 
     wlaczZmianeSzerokosciKolumn(table, header);
@@ -3356,8 +4404,9 @@
       if (job.record) job.record = await ensureRecordClassification(job.id, job.record);
       setTitleCell(job.titleCell, job.record);
       setIssueDateCell(job.issueDateCell, job.record);
-      setSuggestionCell(job.suggestionCell, job.record);
+      ustawKomorkeSugestii(job);
       setOcrCell(job.ocrCell, job.record);
+      ustawKomorkeStanu(job);
     }));
 
     await processWithLimit(jobs, 6, async (job) => {
@@ -3365,10 +4414,14 @@
         job.assigned = await getAssignedCategories(job.id);
         renderPills(job.categoryCell, job.assigned.names, 'Nieprzypisane');
         ustawKolorPrzypisanejReferencji(job);
+        ustawKomorkeSugestii(job);
+        ustawKomorkeStanu(job);
       } catch (error) {
-        job.assigned = { ids: [], names: [] };
+        job.assigned = null;
         job.categoryCell.textContent = 'Błąd odczytu';
         job.categoryCell.title = String(error?.message || error);
+        ustawKomorkeSugestii(job);
+        ustawKomorkeStanu(job);
       }
     });
     return true;
@@ -3405,15 +4458,110 @@
     return btn;
   }
 
+  function tekstRodzajuDopasowania(znaneSzkolenie) {
+    if (znaneSzkolenie?.rodzaj === 'dokladne') {
+      return znaneSzkolenie.podtyp === 'identyczne' ? 'dopasowanie dokładne' : 'dokładne po normalizacji';
+    }
+    return 'dopasowanie przybliżone';
+  }
+
+  function opisKategoriiDopasowania(dopasowanie) {
+    return dopasowanie?.nazwyKategorii?.length
+      ? dopasowanie.nazwyKategorii.join(', ')
+      : (dopasowanie?.kategorie || []).map((identyfikator) => categoryById(identyfikator)?.name || `Kategoria ${identyfikator}`).join(', ');
+  }
+
+  function opisZgodnosciHistorii(znaneSzkolenie) {
+    const wiekszosc = znaneSzkolenie?.wiekszosc;
+    if (!wiekszosc) return znaneSzkolenie?.konflikt ? 'Konflikt bez większości' : '';
+    const kategorie = opisKategoriiDopasowania(wiekszosc);
+    if (znaneSzkolenie.konflikt) return `Konflikt · większość ${wiekszosc.liczba}/${wiekszosc.zeWszystkich}: ${kategorie}`;
+    return `Zgodność ${wiekszosc.liczba}/${wiekszosc.zeWszystkich}: ${kategorie}`;
+  }
+
+  function utworzZnacznikZnaneSzkolenie(znaneSzkolenie) {
+    if (!znaneSzkolenie?.znaleziono) return null;
+    const znacznik = document.createElement('span');
+    znacznik.className = `semper-ref-znane-szkolenie${znaneSzkolenie.konflikt ? ' konflikt' : ''}`;
+    znacznik.textContent = znaneSzkolenie.konflikt ? '⚠ Konflikt historii' : 'Znane szkolenie';
+    const pierwsze = znaneSzkolenie.dopasowania?.[0];
+    znacznik.title = znaneSzkolenie.konflikt
+      ? `${opisZgodnosciHistorii(znaneSzkolenie)}. Podobne wcześniejsze referencje mają różne zatwierdzone kategorie. Otwórz analizę, aby sprawdzić szczegóły.`
+      : `${pierwsze?.tytul || ''} · ${Math.round((pierwsze?.podobienstwo || 0) * 100)}% · ${opisKategoriiDopasowania(pierwsze)}`;
+    return znacznik;
+  }
+
+  function renderujZnaneSzkolenie(kontener, znaneSzkolenie) {
+    if (!znaneSzkolenie?.znaleziono) return;
+    const szczegoly = document.createElement('details');
+    szczegoly.className = `semper-znane-szkolenie${znaneSzkolenie.konflikt ? ' konflikt' : ''}`;
+    szczegoly.open = znaneSzkolenie.konflikt;
+
+    const podsumowanie = document.createElement('summary');
+    const procent = Math.round((znaneSzkolenie.podobienstwo || 0) * 100);
+    const liczbaDopasowan = Number(znaneSzkolenie.liczbaDopasowan || znaneSzkolenie.dopasowania?.length || 0);
+    podsumowanie.textContent = znaneSzkolenie.konflikt
+      ? `⚠ Znane szkolenie · konflikt kategorii · ${procent}% · ${liczbaDopasowan} wcześn.`
+      : `Znane szkolenie · ${tekstRodzajuDopasowania(znaneSzkolenie)} · ${procent}% · ${liczbaDopasowan} wcześn.`;
+    szczegoly.appendChild(podsumowanie);
+
+    const zgodnosc = opisZgodnosciHistorii(znaneSzkolenie);
+    if (zgodnosc) {
+      const informacja = document.createElement('div');
+      informacja.className = 'semper-znane-szkolenie-zgodnosc';
+      informacja.textContent = zgodnosc;
+      szczegoly.appendChild(informacja);
+    }
+
+    if (znaneSzkolenie.konflikt) {
+      const ostrzezenie = document.createElement('div');
+      ostrzezenie.className = 'semper-znane-szkolenie-ostrzezenie';
+      ostrzezenie.textContent = 'Nie wybrano jednej historii: wcześniejsze zatwierdzone rekordy mają różne zestawy kategorii.';
+      szczegoly.appendChild(ostrzezenie);
+    }
+
+    const lista = document.createElement('div');
+    lista.className = 'semper-znane-szkolenie-lista';
+    for (const dopasowanie of znaneSzkolenie.dopasowania || []) {
+      const pozycja = document.createElement('div');
+      pozycja.className = 'semper-znane-szkolenie-dopasowanie';
+      const poprzedniTytul = document.createElement('div');
+      poprzedniTytul.className = 'semper-znane-szkolenie-tytul';
+      poprzedniTytul.textContent = dopasowanie.tytul;
+      const metadane = document.createElement('div');
+      metadane.className = 'semper-znane-szkolenie-metadane';
+      const rodzajZatwierdzenia = dopasowanie.zrodloZatwierdzenia === 'automatyczne' ? 'automatycznie' : 'ręcznie';
+      metadane.textContent = `${dopasowanie.rodzaj === 'dokladne' ? 'Dokładne' : 'Przybliżone'}: ${Math.round(dopasowanie.podobienstwo * 100)}% · Zatwierdzone ${rodzajZatwierdzenia}: ${opisKategoriiDopasowania(dopasowanie) || 'brak nazw'}`;
+      pozycja.append(poprzedniTytul, metadane);
+      lista.appendChild(pozycja);
+    }
+    szczegoly.appendChild(lista);
+    if (liczbaDopasowan > (znaneSzkolenie.dopasowania?.length || 0)) {
+      const pozostale = document.createElement('div');
+      pozostale.className = 'semper-znane-szkolenie-metadane';
+      pozostale.textContent = `Pokazano ${znaneSzkolenie.dopasowania.length} z ${liczbaDopasowan} dopasowań.`;
+      szczegoly.appendChild(pozostale);
+    }
+    kontener.appendChild(szczegoly);
+  }
+
   function renderClassification(container, classification, options = {}) {
     const selectedIds = options.selectedIds instanceof Set ? options.selectedIds : new Set();
     const onSelectionChange = typeof options.onSelectionChange === 'function' ? options.onSelectionChange : null;
 
     container.textContent = '';
+    if (options.zrodloZatwierdzenia === 'automatyczne') {
+      const oznaczenie = document.createElement('div');
+      oznaczenie.className = 'semper-ocr-autoakceptacja-badge';
+      oznaczenie.textContent = '✓ Kategorie zatwierdzone automatycznie';
+      oznaczenie.title = 'Wynik spełnił wszystkie warunki bezpiecznej auto-akceptacji. Automatyczna decyzja nie wzmacnia klasyfikatora.';
+      container.appendChild(oznaczenie);
+    }
     const label = document.createElement('div');
     label.className = 'semper-ocr-label';
     label.textContent = 'Proponowane kategorie:';
     container.appendChild(label);
+    renderujZnaneSzkolenie(container, classification?.znaneSzkolenie);
 
     const resultItems = classification?.results || [];
     const byId = new Map(resultItems.map((item) => [String(item.id), item]));
@@ -3447,15 +4595,8 @@
         const name = document.createElement('span');
         name.className = 'semper-ocr-class-name';
         name.textContent = `${item.name}${isMain ? ' [główna]' : ''}`;
-        const evidence = item.evidence || {};
-        const evidenceParts = [
-          evidence.public ? `oferta SEMPER ${evidence.public}` : '',
-          evidence.user ? `Twoje decyzje ${evidence.user}` : '',
-          evidence.lexical ? `profil językowy ${evidence.lexical}` : '',
-          evidence.domain ? `pojęcia ${evidence.domain}` : '',
-          item.hits?.length ? `trafienia: ${item.hits.join(', ')}` : ''
-        ].filter(Boolean);
-        if (evidenceParts.length) name.title = evidenceParts.join(' · ');
+        const uzasadnienie = uzasadnienieWynikuKlasyfikacji(item);
+        if (uzasadnienie) name.title = uzasadnienie;
 
         const score = document.createElement('span');
         score.className = 'semper-ocr-class-score';
@@ -3488,9 +4629,12 @@
     const meta = document.createElement('div');
     meta.className = 'semper-ocr-status';
     const topScore = classification?.top?.score || 0;
-    meta.textContent = classification?.best
-      ? `Pewność: ${classification.level}. Status: ${classification.status}. Zaznaczenia możesz zmienić niezależnie od wyniku procentowego.`
-      : `Najlepszy kandydat: ${topScore}/100. Status: Wymaga ręcznej weryfikacji (próg kategorii głównej: 70). Możesz zaznaczyć słabszych kandydatów ręcznie.`;
+    const opisKlasyfikacji = classification?.best
+      ? `Wynik główny: ${classification.best.score}%. Status: ${classification.status}. Zaznaczenia możesz zmienić niezależnie od wyniku procentowego.`
+      : `Najlepszy kandydat: ${topScore}/100. Status: Wymaga ręcznej weryfikacji (próg kategorii głównej: ${PROG_KATEGORII_GLOWNEJ}). Możesz zaznaczyć słabszych kandydatów ręcznie.`;
+    const wskaznikPrzewagi = utworzWskaznikPrzewagi(classification);
+    if (wskaznikPrzewagi) meta.append(wskaznikPrzewagi, document.createTextNode(` ${opisKlasyfikacji}`));
+    else meta.textContent = opisKlasyfikacji;
     container.appendChild(meta);
 
     const knowledge = classification?.knowledge || knowledgeSummary();
@@ -3819,12 +4963,16 @@
 
     function updatePanelCategoryDirtyState() {
       const czyWyborBezZmian = sameIdSets(panelSelectedCategoryIds, panelSavedCategoryIds);
+      const czyZatwierdzenieWidoczne = czyKategoriePaneluZatwierdzone && czyWyborBezZmian;
+      const czyAutomatyczne = record?.zrodloZatwierdzeniaKategorii === 'automatyczne';
       setDirty(panelCategoriesDirtyKey, !czyWyborBezZmian);
-      classificationBox.classList.toggle('manual-approved', czyKategoriePaneluZatwierdzone && czyWyborBezZmian);
+      classificationBox.classList.toggle('manual-approved', czyZatwierdzenieWidoczne && !czyAutomatyczne);
+      classificationBox.classList.toggle('auto-approved', czyZatwierdzenieWidoczne && czyAutomatyczne);
     }
 
     function initializeSuggestedSelection(classification) {
       if (panelCategorySelectionTouched || panelSelectedCategoryIds.size || panelSavedCategoryIds.size) return;
+      if (classification?.znaneSzkolenie?.konflikt) return;
       for (const item of [classification?.best, ...(classification?.additional || [])].filter(Boolean)) {
         panelSelectedCategoryIds.add(String(item.id));
       }
@@ -3846,24 +4994,8 @@
         panelSavedCategoryIds = new Set(panelSelectedCategoryIds);
         panelCategorySelectionTouched = false;
         czyKategoriePaneluZatwierdzone = true;
+        record = await utrwalPotwierdzoneKategorie(id, verified, record);
         updatePanelCategoryDirtyState();
-        if (verified.ids.length) await markCategoryAssignmentToday(id);
-        window.dispatchEvent(new CustomEvent('semper-categories-saved', {
-          detail: { id: String(id), ids: verified.ids.map(String), names: verified.names || [] }
-        }));
-
-        const currentRecord = await getRecord(id) || record || {};
-        if (currentRecord?.title || currentRecord?.detectedTitle) {
-          const approved = {
-            ...currentRecord,
-            approvedCategoryIds: verified.ids.map(Number).filter(Boolean),
-            approvedCategoryNames: verified.names,
-            approvedCategoriesAt: Date.now()
-          };
-          await saveRecord(id, approved);
-          await loadLearnedExamples();
-          record = await ensureRecordClassification(id, { ...approved, classifierVersion: '' });
-        }
 
         const inlineSection = document.getElementById('semper-inline-categories');
         if (inlineSection) {
@@ -3888,7 +5020,7 @@
       } finally {
         panelCategorySaving = false;
         if (button) button.disabled = false;
-        renderPanelClassification(record.classification || classify(titleInput.value, getEditableOcrText(ocrText)));
+        renderPanelClassification(record.classification || classify(titleInput.value, getEditableOcrText(ocrText), { pominId: id }));
       }
     }
 
@@ -3898,6 +5030,9 @@
       przyciskZapiszIZastosujKategorie.disabled = panelCategorySaving || !id;
       renderClassification(classificationBox, classification, {
         selectedIds: panelSelectedCategoryIds,
+        zrodloZatwierdzenia: czyKategoriePaneluZatwierdzone && sameIdSets(panelSelectedCategoryIds, panelSavedCategoryIds)
+          ? record?.zrodloZatwierdzeniaKategorii
+          : '',
         onSelectionChange: (selected) => {
           panelSelectedCategoryIds = selected;
           panelCategorySelectionTouched = true;
@@ -3980,13 +5115,17 @@
       savedIssueDateValue = issueDateInput.value;
       savedIssueDateState = currentIssueDateState();
       updateEditorDirtyState();
-      const ocrConf = record.ocrConfidence || 0;
-      const titleConf = record.titleConfidence || 0;
+      const pewnoscOcr = tekstProcentu(record.ocrConfidence);
+      const pewnoscWykryciaTytulu = tekstProcentu(record.titleConfidence);
       status.className = 'semper-ocr-status';
       status.textContent = record.ocrText
-        ? `OCR: ${ocrConf}% (${record.ocrVariant || 'wariant domyślny'}) · tytuł: ${titleConf}% · źródło: ${record.titleSource || '—'}`
+        ? `OCR: ${pewnoscOcr} (${record.ocrVariant || 'wariant domyślny'}) · wykrycie tytułu: ${pewnoscWykryciaTytulu} · źródło: ${record.titleSource || '—'}`
         : 'Brak zapisanego OCR.';
-      renderPanelClassification(record.classification || classify(titleInput.value, getEditableOcrText(ocrText)));
+      if (record.bladAutoakceptacji) {
+        status.className = 'semper-ocr-error';
+        status.textContent += ` · Auto-akceptacja nieudana: ${record.bladAutoakceptacji}`;
+      }
+      renderPanelClassification(record.classification || classify(titleInput.value, getEditableOcrText(ocrText), { pominId: id }));
     }
 
     async function run(force = false) {
@@ -4011,6 +5150,7 @@
         displayRecord();
         announceRecordUpdate(id, record);
       } catch (error) {
+        record = await zapiszBladOcr(id, error, record);
         status.className = 'semper-ocr-error';
         status.textContent = `Błąd OCR: ${error?.message || error}`;
       } finally {
@@ -4021,7 +5161,7 @@
     save.addEventListener('click', async () => {
       const manualTitle = cleanTitle(titleInput.value);
       const currentOcrText = getEditableOcrText(ocrText);
-      const classification = classify(manualTitle, currentOcrText);
+      const classification = classify(manualTitle, currentOcrText, { pominId: id });
       record = {
         ...record,
         manualTitle,
@@ -4030,7 +5170,8 @@
         titleApprovedAt: Date.now(),
         ocrText: currentOcrText,
         classification,
-        classifierVersion: CLASSIFIER_VERSION
+        classifierVersion: CLASSIFIER_VERSION,
+        klasyfikacjaUtworzonaAt: Date.now()
       };
       if (id) await saveRecord(id, record);
       titleInput.value = manualTitle;
@@ -4097,7 +5238,7 @@
       const manualTitle = cleanTitle(selectedText);
       titleInput.value = manualTitle;
       const currentOcrText = getEditableOcrText(ocrText);
-      const classification = classify(manualTitle, currentOcrText);
+      const classification = classify(manualTitle, currentOcrText, { pominId: id });
       record = {
         ...record,
         manualTitle,
@@ -4105,7 +5246,8 @@
         titleApprovalSource: 'ocr-selection',
         titleApprovedAt: Date.now(),
         classification,
-        classifierVersion: CLASSIFIER_VERSION
+        classifierVersion: CLASSIFIER_VERSION,
+        klasyfikacjaUtworzonaAt: Date.now()
       };
       if (id) await saveRecord(id, record);
 
@@ -4171,7 +5313,7 @@
 
     titleInput.addEventListener('input', () => {
       const currentOcrText = getEditableOcrText(ocrText);
-      const previewClassification = classify(titleInput.value, currentOcrText);
+      const previewClassification = classify(titleInput.value, currentOcrText, { pominId: id });
       renderPanelClassification(previewClassification);
       updateEditorDirtyState();
       updateTitleApprovalStyle();
@@ -4191,7 +5333,7 @@
         const assigned = await getAssignedCategories(id);
         panelSavedCategoryIds = new Set((assigned?.ids || []).map(String));
         panelSelectedCategoryIds = new Set(panelSavedCategoryIds);
-        czyKategoriePaneluZatwierdzone = panelSavedCategoryIds.size > 0;
+        czyKategoriePaneluZatwierdzone = czyKategorieZostalyZatwierdzone(record, assigned);
         updatePanelCategoryDirtyState();
       } catch (error) {
         console.warn('[SEMPER OCR] Nie udało się wczytać zapisanych kategorii do panelu OCR.', error);
@@ -4199,12 +5341,13 @@
 
       window.addEventListener('semper-categories-saved', (event) => {
         if (String(event.detail?.id || '') !== String(id)) return;
+        record = event.detail?.record || record;
         panelSavedCategoryIds = new Set((event.detail?.ids || []).map(String));
         panelSelectedCategoryIds = new Set(panelSavedCategoryIds);
         panelCategorySelectionTouched = false;
         czyKategoriePaneluZatwierdzone = true;
         updatePanelCategoryDirtyState();
-        const currentClassification = record?.classification || classify(titleInput.value, getEditableOcrText(ocrText));
+        const currentClassification = record?.classification || classify(titleInput.value, getEditableOcrText(ocrText), { pominId: id });
         renderPanelClassification(currentClassification);
       });
     }
@@ -4243,7 +5386,12 @@
     utworzLubAktualizujPodgladOryginalu(imageUrl);
     if (!record?.ocrText) {
       if (imageUrl) {
-        try { record = await analyzeReference(id, imageUrl); } catch (error) { console.warn('[SEMPER OCR]', error); }
+        try {
+          record = await analyzeReference(id, imageUrl);
+        } catch (error) {
+          record = await zapiszBladOcr(id, error, record);
+          console.warn('[SEMPER OCR]', error);
+        }
       }
     }
     imageUrl = record?.imageUrl || imageUrl;
@@ -4259,15 +5407,7 @@
     if (sessionStorage.getItem(pendingLearningKey) === '1' && record?.title) {
       try {
         const assigned = await getAssignedCategories(id, true);
-        record = {
-          ...record,
-          approvedCategoryIds: assigned.ids.map(Number).filter(Boolean),
-          approvedCategoryNames: assigned.names,
-          approvedCategoriesAt: Date.now()
-        };
-        await saveRecord(id, record);
-        await loadLearnedExamples();
-        record = await ensureRecordClassification(id, { ...record, classifierVersion: '' });
+        record = await utrwalPotwierdzoneKategorie(id, assigned, record, { zrodloZatwierdzenia: 'reczne' });
         sessionStorage.removeItem(pendingLearningKey);
       } catch (error) {
         console.warn('[SEMPER OCR] Nie udało się zapisać decyzji kategorii jako przykładu uczącego.', error);

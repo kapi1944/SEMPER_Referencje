@@ -11,6 +11,15 @@
     <h1>SEMPER – Referencje OCR</h1>
     <p id="stan" class="stan">Sprawdzanie stanu…</p>
 
+    <section class="autoakceptacja">
+      <h2>Bezpieczna auto-akceptacja</h2>
+      <label class="przelacznik">
+        <input id="autoakceptacja-kategorii" type="checkbox">
+        <span>Automatycznie zatwierdzaj tylko bardzo pewne klasyfikacje</span>
+      </label>
+      <p>Działa wyłącznie po nowym lub ręcznie ponowionym OCR. Nie przetwarza automatycznie zapisanej wcześniej listy.</p>
+    </section>
+
     <section>
       <h2>Wyłącz czasowo</h2>
       <div class="siatka">
@@ -23,7 +32,7 @@
 
     <button id="wylacz-bezterminowo" type="button" class="drugorzedny">Wyłącz do ponownego włączenia</button>
     <button id="wlacz" type="button" class="glowny">Włącz teraz</button>
-    <p class="informacja">Zmiana odświeży otwartą stronę panelu SEMPER.</p>
+    <p class="informacja">Włączenie lub wyłączenie całej wtyczki odświeży otwartą stronę panelu SEMPER.</p>
   </main>
   <script src="popup.js"></script>
 </body>
